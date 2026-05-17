@@ -452,13 +452,13 @@ test_guard_blocks() {
 }
 
 echo "  --- A: 命令变体绕过 ---"
-# A1: rm -r -f 分离 flags（已知绕过）
-test_guard_blocks "rm -r -f .git (分离flags)" "rm -r -f .git" "no"
-# A2: rm --recursive --force（已知绕过）
-test_guard_blocks "rm --recursive --force .git (长参数)" "rm --recursive --force .git" "no"
-# A3: find -delete（已知绕过）
-test_guard_blocks "find .git -delete (等价命令)" "find .git -type f -delete" "no"
-# A4: perl rmtree（已知绕过）
+# A1: rm -r -f 分离 flags（已修复：宽兜底规则）
+test_guard_blocks "rm -r -f .git (分离flags)" "rm -r -f .git" "yes"
+# A2: rm --recursive --force（已修复：宽兜底规则）
+test_guard_blocks "rm --recursive --force .git (长参数)" "rm --recursive --force .git" "yes"
+# A3: find -delete（已修复：宽兜底规则）
+test_guard_blocks "find .git -delete (等价命令)" "find .git -type f -delete" "yes"
+# A4: perl rmtree（已知绕过，容器层兜底）
 test_guard_blocks "perl rmtree (替代工具)" "perl -e 'use File::Path; rmtree(\".git\")'" "no"
 
 echo ""
