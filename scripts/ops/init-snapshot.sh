@@ -136,12 +136,17 @@ if [ -e "$VERSION_DIR" ]; then
 fi
 mv "$STAGING_DIR" "$VERSION_DIR"
 
-# === Step 4-5: 切换 current symlink（相对路径 + 原子 mv）===
-# 在 SNAPSHOT_DIR 内创建 current.new，再 mv 到 current
-# 用 mv 实现原子替换（rename(2) 是原子的）
+# === Step 4-5: 切换 current symlink（相对路径 + 原子覆盖）===
+# ln -sfn 在 Linux/macOS 上都是原子替换 symlink（内部 rename(2)）
+# 不能先创 current.new 再 mv：mv 看到 current 是 symlink 指向目录，
+# 会把 current.new 移动 *进* 那个目录，而不是替换 symlink 本身！
 cd "$SNAPSHOT_DIR"
-ln -sfn "versions/$SNAPSHOT_ID" "current.new"
-mv -f "current.new" "current"
+# 防御：如果 current 存在且是真目录，停止（手工修复）
+if [ -e "current" ] && [ ! -L "current" ]; then
+  echo "FATAL: 'current' exists but is not a symlink (manual cleanup needed)" >&2
+  exit 1
+fi
+ln -sfn "versions/$SNAPSHOT_ID" "current"
 cd - >/dev/null
 
 # === Step 6: 顶层 metadata 原子写 ===
