@@ -572,3 +572,155 @@ bash "$SANDBOX/scripts/ops/ops-watcher.sh"
 - B.3 完整生产 SOP：lifecycle 4 档 + proposal 4 档 + heartbeat（间隔可临时设
   60s 加速测试）一次性测完
 - B.4 launchd plist 开机自启，加 SR 启动顺序约束 + heartbeat 作为侧面信号
+
+
+
+---
+
+## Checkpoint：B.2 hotfix 生产实测通过（2026-05-17）
+
+```
+manifest 拉新代码 → sed 改 .ops-watcher.env 一行 → 重启 watcher
+↓
+手机收到：ℹ️ ops-watcher started (snapshot=20260517T085136Z)
+```
+
+hotfix 三件事一次落地全过：`TELEGRAM_PROXY_URL` + `LAST_TELEGRAM_HTTP_CODE`
+诊断 + heartbeat。配置层（端口 1082）+ 代码层（专用变量 + http_code 暴露 +
+心跳）一起到位。
+
+### 排查回血记录（以防再现类似问题）
+
+#### 现场症状
+
+- watcher 主循环正常上线（终端显示 `[ops-watcher] using fswatch`）
+- 手机收不到 started 通知
+- events.jsonl 末尾两条：`{"lvl":"error","event":"started"}` + `{"lvl":"error","event":"stopped"}`
+
+#### 现象解读（事后回看是清晰的）
+
+events.jsonl 里 lifecycle 事件**走 error 分支**意味着：
+- watcher 主流程没崩（事件被记下了）
+- TELEGRAM_DISABLED ≠ 1（否则 lifecycle 会 early return 不写日志）
+- env 加载完成 + token/chat_id 都已读到
+- 唯一失败的就是 `send_telegram_raw` 的 curl 调用本身
+
+**但当时绕远的核心原因**：B.2 原版 `send_telegram_raw` 抛掉 curl 的
+`%{http_code}` 没记日志，events.jsonl 只看到 `telegram send failed` 这 6 个字，
+区分不出"代理端口不通 (000)" / "token 错 (401)" / "chat_id 错 (400)"。
+诊断信息缺失就是开发债，把后面 1 小时的回路都浪费了。
+
+#### 用户钉死根因的关键诊断手法
+
+按用户原话："**同一 token 经不同代理端口经 getMe 直接对照测**"：
+
+```
+HTTPS_PROXY=http://127.0.0.1:1086 经 getMe → connection refused
+HTTPS_PROXY=http://127.0.0.1:1082 经 getMe → ok:true
+```
+
+一个变量比另一个变量精确（端口号），就直接对照测——立刻钉死是端口飘移，
+不是 token / 不是 SNI 阻断 / 不是 macOS curl 病态。
+
+下次类似症状的诊断顺序（钉死/排除环节，不要绕到中间结论）：
+
+1. `tail -5 events.jsonl | jq -c '{lvl,msg,extra}'` 看 watcher 自己的失败原因
+2. **现在已经有 http_code**（hotfix 后），看 `extra.http_code`：
+   - `000` → 代理端口不通 / DNS 失败 / TLS 被中间设备 reset
+   - `401` → token 错
+   - `400 / 404` → chat_id 错
+   - `429` → rate limit
+3. 只有 `000` 才需要进一步分层诊断（nc / curl --noproxy / curl 别的域名）
+
+这里的关键教训：**给失败路径足够的诊断信息是不可妥协的**。`telegram send failed`
+不带 http_code = 把所有失败模式合并成一个，浪费定位时间。hotfix 已修。
+
+#### 我的反思（chat-agent 反复回头记录）
+
+诊断中我有 4 个错误前提，每个都让排查绕了一段路：
+
+1. **直觉性误判 1**：见到 `SSL_ERROR_SYSCALL` 立刻归因"GFW 对 telegram 域名做 SNI
+   阻断"。现实：SR 在 Mac 上**确实**接管了浏览器流量（用户实测能上 telegram
+   网页），是宿主机 curl 用的过期代理端口。
+2. **直觉性误判 2**：误以为"iOS 版 SR 装在 Apple Silicon Mac 上不工作"。现实：
+   PacketTunnel.appex 真在跑，端口配置只是飘了。
+3. **盲区**：B.2 没把 http_code 写进 events.jsonl 是开发债。
+4. **越界**：用户多次给反证（"浏览器能上 google"、"bot 定时消息能收"），我没
+   立刻撤回错误结论，仍按错前提推下去。直到用户当面钉死才转向。
+
+教训：**用户的现场观察是事实证据，不是需要驳斥的对象**。下次类似现象，先
+拿用户的反证当锚点，反推自己结论的弱点，不要按预设结论推到最后。
+
+### 分支拓扑（下个窗口的入口）
+
+```
+main
+└── ops-watcher-step-b               ← Step A + A.1 + B.0 + B.1 + B.2 沙箱稿（未生产实测）
+    └── ops-watcher-step-b-hotfix    ← B.2 hotfix（已生产实测通过 ★ 当前推荐分支）
+        commit 5d4d6b4 — TELEGRAM_PROXY_URL + http_code 诊断 + heartbeat
+        commit 5ce4c9b — feat(B.2): Telegram one-way summary notifications
+```
+
+**生产宿主机当前运行的代码 = `ops-watcher-step-b-hotfix` 分支 5d4d6b4**。
+config: `~/ai_sandbox/.ops-watcher.env` 含 `TELEGRAM_PROXY_URL=http://127.0.0.1:1082`。
+
+### 给下个窗口的入口指令
+
+> "继续 ops-watcher 项目的 Step B.3。读 `OPS-WATCHER-DESIGN.md` 与
+> `HANDOFF-OPS-WATCHER.md`，然后实施 B.3 完整生产实测 SOP。
+> 当前分支：`ops-watcher-step-b-hotfix`。生产已运行此分支代码，started
+> 通知收到了，但 lifecycle 4 档 + proposal 4 档 + heartbeat 都还没系统测过。"
+
+### B.3 完整测试清单（下窗口要做）
+
+heartbeat 间隔默认 6h，测试时建议先用短间隔加速：
+
+```bash
+# 临时 60s 间隔加速测试
+OPS_HEARTBEAT_INTERVAL=60 bash scripts/ops/ops-watcher.sh
+```
+
+#### Lifecycle 4 档边沿测试
+
+| 动作 | 期望手机收到 | 期望 events.jsonl |
+|---|---|---|
+| `bash ops-watcher.sh` | started | `info "telegram sent"` `kind=lifecycle event=started http_code=200` |
+| `touch .ops-watcher.disabled` | disabled (next loop iteration) | 同上 `event=disabled` |
+| `rm .ops-watcher.disabled` | resumed | 同上 `event=resumed` |
+| `Ctrl-C` | stopped | 同上 `event=stopped` |
+
+注意：**首次启动 prev="" 不发 resumed**（设计内）。`.lifecycle-state` 文件
+内容验证：`cat ops_spool/.lifecycle-state` 应该等于 `enabled`。
+
+#### Proposal 4 档（status × risk matrix）
+
+| 提交内容 | 期望 status × risk | 期望手机 | 期望幂等表 |
+|---|---|---|---|
+| 白名单加 1 域名 | accepted_for_review × LOW | ✅ 通知 | `<id>:accepted_for_review:LOW` |
+| Dockerfile 装包 | accepted_for_review × MEDIUM | 🟡 通知 | `<id>:accepted_for_review:MEDIUM` |
+| 新增服务 | accepted_for_review × HIGH | 🔴 通知 | `<id>:accepted_for_review:HIGH` |
+| 改 guard.sh 路径 | blocked × BLOCK | 🚨 通知 | `<id>:blocked:BLOCK` |
+| supersedes 走通 | superseded sibling | **静默** | 不进幂等表 |
+
+#### Heartbeat
+
+设 `OPS_HEARTBEAT_INTERVAL=60` 启动，等 60s 后手机应该收到：
+```
+📊 watcher heartbeat
+snapshot=... queue=... last=...
+```
+然后 60s 再一次。**不进幂等表**，每次都发是设计目的。
+
+#### 失败路径（断网模拟）
+
+- 关掉 SR / 把 `TELEGRAM_PROXY_URL` 改成假端口
+- 触发一个 LOW proposal
+- 期望：events.jsonl 出现 `error "telegram send failed"` `http_code=000`
+- **关键**：`.notified.txt` 不应被污染（`grep <id> .notified.txt` 应该为空）
+- 恢复 SR 后再触发一个 LOW（或重提同 proposal）：`.notified.txt` 这时才追加
+
+#### B.4 之前的已知约束（不需要在 B.3 测，但要写进文档）
+
+- fswatch 模式长时间无 proposal 流量会错过 heartbeat tick（B.4 launchd 重构时再改）
+- launchd 自启时若 SR 还没起来，started 通知会丢——主流程不受影响（B.4 加启动顺序约束）
+- `kill -9` / OOM kill 不触发 stopped 通知——这是设计内盲区，靠 heartbeat 兜底
