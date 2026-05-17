@@ -17,6 +17,11 @@
 #     → classify risk (LOW/MEDIUM/HIGH)
 #     → accepted_for_review
 #
+# 关键抽象（B.1 hotfix v2）：
+#   get_effective_status(id) = proposal 当前生命周期投影
+#   任何决策（conflict 占位、supersedes target、未来 apply 队列）都通过此函数，
+#   不直接读 <id>.json.status。详见函数注释 + OPS-WATCHER-DESIGN.md。
+#
 # 输出：
 #   ops_spool/events.jsonl                每个动作一行 JSON
 #   ops-results/<id>.json                 权威记录（含 manifest 完整副本）

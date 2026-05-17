@@ -253,6 +253,50 @@ diff -r .snapshot/ $TMP/                                # 生成 diff 摘要
 | rolled_back | apply 后失败已回滚 |
 | expired | TTL 24h 未处理 |
 
+### effective_status：proposal 当前生命周期投影
+
+> 这是 Step B.1 hotfix v2 引入的抽象，**任何 watcher 决策都必须读 effective_status，不直接读 `<id>.json.status`**。
+
+**为什么需要这个抽象：**
+
+`ops-results/<id>.json` 是 proposal 的*初始裁决*，写入即只读（不可变性是协议不变量）。但 proposal 实际状态会在闭合后通过 sibling 文件继续演进：
+
+- 一期 sibling: `<id>.superseded.json`（被新 proposal 替代）
+- Phase 4 sibling: `<id>.applied.json` / `<id>.rolled_back.json`
+
+如果用 `<id>.json.status` 推断"当前还占不占位 / 还能不能被 supersede 当作 target / 是不是可以进 apply 队列"，等于用过期视图判断当前——会出现"幽灵换名字回来"的 bug 类。Step B.1 hotfix v1 试图在 conflict 检查里加一行 sibling 兜底，立刻在 supersedes target 验证那条对称路径暴露了同样的设计缺陷。
+
+**effective_status 的语义：**
+
+```
+""                       proposal 不存在
+pending                  目录在但还没出 result（已 submit 还没被 watcher 处理 / 半成品）
+accepted_for_review      仍占位（可被 supersede 当 target / 与其他 proposal 路径冲突）
+superseded               一期 sibling 投影；优先级高于 .json.status
+blocked / rejected /
+preflight_failed /
+stale / conflict /
+disabled                 已闭合（不占位）
+```
+
+读取规则（按优先级，单一函数 `get_effective_status` 实现）：
+
+1. proposal 目录不存在 → `""`
+2. 没 `.json` → `pending`
+3. 任意已知 sibling 文件存在 → 取 sibling 表示的状态（一期只有 `.superseded.json` → `superseded`）
+4. 否则 → `<id>.json.status`
+
+**watcher 内部的两条具体规则：**
+
+- conflict 占位检测：`effective_status ∈ {accepted_for_review, pending}` 视为占位
+- supersedes target 合法性：必须 `effective_status == accepted_for_review`（pending 不允许，应等旧的先出结果；闭合状态不再占位故无需 supersede）
+
+**为什么这个抽象稳定：**
+
+Phase 4 加 lifecycle sibling 时，`get_effective_status` 加 1 行 case 即可识别新状态；conflict / 未来 apply 队列 / 任何 lifecycle 决策**不需要再改一行**。
+
+不变量：**`<id>.json.status` 永远是初始裁决；`effective_status` 永远是当前投影**。文档里出现"读 status"四个字时，必须问清楚是哪个。
+
 ## Apply 流程
 
 ### 命令接口
