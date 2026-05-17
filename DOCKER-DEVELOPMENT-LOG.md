@@ -785,3 +785,52 @@ chmod +x scripts/e2e-extended-test.sh
 - 分支：`security-testing-suite`
 - PR：https://github.com/nydydc474g-art/kiro-projiects/pull/1
 - 状态：待本机验证
+
+
+
+### 扩展安全测试首轮实测结果（2026-05-17）
+
+环境：macOS Mac mini, `/bin/bash` 3.2, Docker Desktop
+
+#### 首轮实测发现的脚本兼容性问题
+
+| 问题 | 原因 | 修复 |
+|------|------|------|
+| `set -u` + `${VAR:-default}` 崩溃 | macOS bash 3.2 对 subshell 赋值空值时仍报 unbound | 去掉 `-u`，改为 `set -eo pipefail` |
+| GitHub raw CDN 缓存 | curl 下载到旧版本文件 | 直接 push 后等待 CDN 刷新 |
+
+#### 首轮安全测试结果（T1~T4 已完成）
+
+| 组 | 结果 | 说明 |
+|----|------|------|
+| T1.1 根文件系统只读 | ✅ | Read-only file system |
+| T1.2 capabilities | ✅ | CapEff = 0 |
+| T1.3 Docker socket | ✅ | 不存在 |
+| T1.4 /proc 隔离 | ✅ | PID namespace 正常 |
+| T1.5 mount | ⚠️ 测试误判 | 容器返回 `must be superuser`（实际是被拒，正则需补充） |
+| T1.6 no-new-privileges | ✅ | NoNewPrivs = 1 |
+| T2.1~T2.5 网络逃逸 | ✅✅✅✅✅ | 全绿：直连被拦、squid 白名单生效、IP 绕过被拒、非 443 被拒、DNS 隔离 |
+| T3.1 环境变量 | ✅ | 仅 dummy token |
+| T3.2 litellm 管理接口 | ⚠️ | 模型列表可见但无真实 key（已知风险） |
+| T3.3 /app/.claude | ✅ | 仅 hooks/settings |
+| T3.4 /proc/self/environ | ✅ | 无外部凭据 |
+| T4.1 audit_spool :ro | ✅ | 写入被拒 |
+| T4.2 审计日志删除 | ✅ | rm 失败 |
+| T4.3 噪声注入 | ⚠️ | 可注入但不影响完整性（已知风险） |
+| T4.4 rate limit | ✅ | 100 发送 → 0 落盘（collector 限流生效） |
+
+#### T5 部分结果
+
+| 测试 | 结果 | 说明 |
+|------|------|------|
+| T5.1 PID 限制 | ✅ 实际通过 | fork bomb 触发 `Resource temporarily unavailable`，证明 pids_limit 生效；脚本解析逻辑需修 |
+| T5.2 /tmp 容量 | 待确认 | 脚本在 T5.1 后因解析错误中断 |
+
+#### 待修复（测试脚本 bug，非安全问题）
+
+1. **T1.5 mount 正则**：补充匹配 `must be superuser`（等价于 permission denied）
+2. **T5.1 PID 输出解析**：fork 失败时 stderr 混入 stdout，需要更健壮的数值提取
+
+#### 结论
+
+**核心安全边界全部验证通过。** 两个 FAIL 都是测试脚本的判断逻辑问题，不是 Docker 配置有漏洞。下一步修复这两个 test case 后跑完 T5~T10。
