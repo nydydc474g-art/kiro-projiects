@@ -11,18 +11,77 @@
 > **本文件追加式更新，前文不重写。**
 > 如果你是新窗口的 agent，先读这一段定位进度，再按指引跳到末段。
 
-- 当前最新分支：`ops-watcher-step-b-hotfix`（含 commit `3c0a60c` line 573 修复）
+- 当前最新分支：`ops-watcher-step-b-hotfix`（含 commit `3c0a60c` line 573 修复 + `26696aa` 文档同步）
 - 生产宿主机当前实际跑的：**`ops-watcher-step-b-hotfix` 头部代码** + watcher 在前台 polling 模式跑着
 - env 当前形态：`TELEGRAM_PROXY_URL=http://127.0.0.1:1082`（cutover 已完成）
 - B.2 hotfix 三件事 + line 573 修复**全部生产实证通过**（详见末段 checkpoint）
 - Lifecycle 4 档：started ✅ disabled ✅ resumed ✅ / stopped 留到 B.3 末尾
-- B.3 proposal 4 档：**即将开始**
+- B.3 proposal 4 档：LOW ✅ `20260517-122027-ea3b87` / MEDIUM ✅ `20260517-122337-7f1f91` / HIGH ✅ `20260517-123059-9048d1` / BLOCK 待做
 - 下窗口（如果是新会话接手 B.3 之后阶段）的入口：跳到末段最新一条 checkpoint
   `Checkpoint：B.2 hotfix 生产实证 + line 573 修复（2026-05-17）`
 
 历史快照（仅供查阅，不要照做）：
 - 末段 `下窗口必跑：Cutover SOP` —— cutover 已完成，**SOP 不再需要执行**
 - 末段 `Checkpoint：B.2 hotfix 沙箱完成；生产仍未实测` —— 已被新 checkpoint 覆盖
+- 中段 `### 分支拓扑（下个窗口的入口）`（约 line 700，埋在 B.2 hotfix 段内）
+  —— 当时分支信息已过期，**以本节正下方 `## 当前分支拓扑（最新）` 为准**
+
+---
+
+## 当前分支拓扑（最新，2026-05-17 晚）
+
+```
+main
+├── ops-watcher-step-b               Step A + A.1 + B.0 + B.1 + B.2 沙箱稿
+│                                    （5ce4c9b 头）
+│                                    生产**已不再跑这份**，cutover 后切到 hotfix 分支
+│
+└── ops-watcher-step-b-hotfix        当前生产分支 ★
+    │   ↓ 提交链（最新在上）
+    ├── 26696aa  docs(B.2): hotfix production-verified + line 573 fix + lifecycle 3/4
+    ├── 3c0a60c  fix(B.2): heartbeat queue count — replace ls glob with find  ★ 关键 fix
+    ├── bab4733  docs(B.2): correct hotfix verification status — sandbox done, production untested
+    ├── d1a1210  docs(B.2): branch topology + B.3 checklist + cutover SOP (当时叙事有误，bab4733 已纠正)
+    ├── 5d4d6b4  fix(B.2): TELEGRAM_PROXY_URL + http_code diagnostics + heartbeat
+    └── 5ce4c9b  feat(B.2): Telegram one-way summary notifications  (= ops-watcher-step-b 头)
+```
+
+**生产宿主机当前运行的代码 = `ops-watcher-step-b-hotfix` 分支头**（HEAD =
+26696aa；可执行代码到 3c0a60c 即生效，26696aa 之后只动文档）。
+config: `~/ai_sandbox/.ops-watcher.env` = `TELEGRAM_PROXY_URL=http://127.0.0.1:1082`。
+watcher 进程 PID 38521 在前台跑着（polling 模式，`OPS_HEARTBEAT_INTERVAL=60` 测试加速）。
+
+### 合并策略（暂未决，留给收尾时再讨论）
+
+- **选项 A**：B.3 + B.4 全部跑完后，把 `ops-watcher-step-b-hotfix` 合回
+  `ops-watcher-step-b`，再合 main
+- **选项 B**：B.3 / B.4 继续在 hotfix 分支推，最后整条合 main
+  （hotfix 分支演化成事实上的 step-b 终稿）
+
+用户偏好的"追加不重写"叙事更适合选项 B——历史 commit 不动，反映"hotfix
+分支自然演化成 step-b 终稿"的事实。但这是收尾决策，不在 B.3 / B.4 范围内。
+
+**下窗口接手时不要主动合并 / rebase**，先确认用户意图。
+
+### 分支命名为什么留着 "-hotfix" 后缀
+
+不改名是有意的：
+
+- 改名（rename branch）= 强行重写历史叙事（"它从来都是 step-b 的一部分"）
+- 不改名 = 保留事实（"这是为修一个生产 bug 临时开的分支，最后承担了远超原始范围的工作"）
+- 选项 B 合并时，git history 会原样保留 `ops-watcher-step-b-hotfix` 这个分支名
+  作为提交注解的一部分，对 5 年后回看的人是有价值的考古证据
+
+**下窗口若想"清理一下"改名，先确认。**
+
+### 远端 SHA 和本地 SHA 的小注
+
+`gateway.connections.autonomous-agents.kiro.dev` 这条 git 远端在 push 时会
+**重签提交**（保留所有内容和提交消息，但 SHA 改变）。所以：
+
+- 本地（agent sandbox）和 GitHub 上看到的 SHA 不完全一致
+- 上面提交链的 SHA 是 **GitHub 远端**值（用户走 raw.githubusercontent.com / 网页看到的就是这一份）
+- 这是 gateway 工作模式的副作用，不是 bug，**不要试图 rebase 对齐**
 
 ---
 
@@ -973,3 +1032,139 @@ caimin@... 38521 ... bash /Users/caimin/ai_sandbox/scripts/ops/ops-watcher.sh
 - B.3 失败路径（断网/假端口 → LOW proposal → http_code=000 + `.notified.txt` 不污染）
 - B.3 lifecycle stopped（Ctrl-C）
 - B.4 launchd plist 开机自启
+
+
+
+
+---
+
+## Checkpoint：B.3 proposal 3/4 档实证（2026-05-17）
+
+> 追加日志，不改前文。LOW / MEDIUM / HIGH 三档生产实证 + status × risk matrix
+> 三格闭合。BLOCK 一格留给下窗口。
+
+### 一句话
+
+通过 helper 容器内 `ops-propose` 流程，依次提交 LOW / MEDIUM / HIGH proposal，watcher 全部正确分类、正确推送通知、正确写幂等表；HIGH 路径同时实证三层闸门（baseline invariants → global rules → preflight compose_config）穿透 + 真分类。
+
+### 三档生产证据
+
+```
+LOW    20260517-122027-ea3b87   proxy/allowed_domains.txt + supersedes 20260517-084006-28b44c
+       preflight: compose_config=not_run, dockerfile_lint=not_run
+       附带证据：旧 084006 长出 .superseded.json sibling，effective_status 投影闭合
+                superseded sibling 静默不进 .notified.txt
+                B.1 hotfix v2 设计意图（effective_status 抽象）二轮实证
+
+MEDIUM 20260517-122337-7f1f91   proxy/squid.conf no-op marker comment
+       preflight: compose_config=not_run, dockerfile_lint=not_run
+       Telegram: 🟡 + apply 简便命令 + diff 选项
+
+HIGH   20260517-123059-9048d1   docker-compose.yml: squid 服务加 healthcheck 段
+       preflight: compose_config=ok ★ 真跑了，dockerfile_lint=not_run
+       Telegram: 🔴 + "HIGH RISK — REVIEW CAREFULLY" + 强制 --high 标志
+```
+
+### HIGH 这一档的特别意义（设计层面）
+
+这条 HIGH proposal **没被 BLOCK** 也**没 preflight_failed**，是穿过整条管道每一个真闸门后才被分类到 HIGH 的：
+
+| 闸门 | 状态 | 证据 |
+|---|---|---|
+| `check_baseline_invariants` | 通过 | 候选 compose 没改 agent 的 read_only / cap_drop / security_opt / user / 必需挂载 |
+| `check_global_rules` | 通过 | 没命中 privileged / docker.sock / cap_add / ports / host net|ipc|pid|userns |
+| `isolated_preflight` | 通过 | preflight.compose_config.status=`ok` —— `docker compose config` 真跑了一遍 |
+| `classify_risk` | 命中 HIGH | 因为 `has_compose=1` |
+
+LOW 和 MEDIUM 这两档在 isolated_preflight 这一段是 `not_run`（路径白名单内但不涉及 docker-compose.yml / Dockerfile，preflight 直接跳过）。HIGH 这条**真的去跑了 docker compose config**，是 HIGH 路径独有的物理证据。
+
+不是 "它被 classify_risk 函数判定成 HIGH 这么简单"，而是 "它穿过 baseline 守门 + 全局规则扫描 + compose 预演，仍被接受，再被分级"。这是一次完整的端到端集成测试。
+
+### 状态 × risk matrix 闭合情况
+
+| status × risk | 推送 | 实证 |
+|---|---|---|
+| accepted_for_review × LOW | ✅ | 122027 ✓ |
+| accepted_for_review × MEDIUM | ✅ | 122337 ✓ |
+| accepted_for_review × HIGH | ✅ | 9048d1 ✓ |
+| blocked × BLOCK | ✅ | 留待下窗口 |
+| superseded sibling | 静默 | 084006 ✓（间接实证） |
+
+矩阵 5 格中 4 格已闭合。BLOCK 一格是最后一块拼图。
+
+### `.notified.txt` 状态（B.3 实证中三档累积）
+
+```
+20260517-122027-ea3b87:accepted_for_review:LOW
+20260517-122337-7f1f91:accepted_for_review:MEDIUM
+20260517-123059-9048d1:accepted_for_review:HIGH
+```
+
+三行干净对应三档，每条 proposal 一行。两个 hardening 约束实证：
+- 三元组 `<id>:<status>:<risk>` 是幂等表唯一格式（lifecycle / heartbeat / superseded sibling 全部不进表）
+- 仅 HTTP 200 后才追加（events.jsonl 三条 `telegram sent` 全部 http_code=200）
+
+### Telegram 文案分层验证
+
+四档 emoji + 文案分层都对：
+
+| risk | emoji | 关键文案 | apply 命令 |
+|---|---|---|---|
+| LOW | ✅ | 普通摘要 | `apply: ops <short>` |
+| MEDIUM | 🟡 | 普通摘要 + diff 选项 | `apply: ops <short>` + `diff: ops-diff <short>` |
+| HIGH | 🔴 | "HIGH RISK — REVIEW CAREFULLY" | `review: ops-diff <short>` + `apply (must use --high): ops-apply --high <short>` |
+| BLOCK | 🚨 | 待 | 待（设计上：`audit: ops-spool view <short>` + 不提供 apply 命令） |
+
+HIGH 文案的心理摩擦做出来了——没有简便 `ops <id>`，必须用更长的 `ops-apply --high <id>`。MEDIUM 和 HIGH 的视觉区别（🟡 vs 🔴 + 加强警示语）对手机阅读体验是关键。
+
+### 顺手钉死的几件事
+
+1. **B.1 烟雾弹清理**：084006 这条 B.1 时代留下的"幽灵占位"通过 122027 的 supersede 顺手清掉。effective_status 投影机制在 B.1 hotfix v2 的两轮实证全部通过（一次是 supersedes target 合法性、一次是 conflict 占位检测）。
+2. **PROPOSAL_PATH_ALLOWED 路径白名单实测**：MEDIUM 用 `proxy/squid.conf`，HIGH 用 `docker-compose.yml`，两条都在白名单内，watcher 都接受。
+3. **classify_risk 规则实测**：
+   - `proxy/allowed_domains.txt` → LOW
+   - `proxy/squid.conf` → MEDIUM
+   - `docker-compose.yml` → HIGH
+   分级规则与 watcher 代码 line 1180-1220 的 `classify_risk` 函数完全一致。
+
+### BLOCK 档预设计（下窗口做）
+
+BLOCK 档语义跟前三档不同：前三档是"agent 提了合法变更"，BLOCK 是"agent 试图触碰绝对不变量"。
+
+两条触发路径：
+- 路径 1：BLOCK paths（早闸门，第 3 个 check）— 路径白名单外，如 `claude_config/hooks/guard.sh`
+- 路径 2：global rules（晚闸门，compose 改动后）— 如加 `privileged: true`
+
+按 B.3 测试目标只需测一条。**推荐路径 1**（更简单、不碰 YAML）。
+
+**关键挑战**：helper 前端 `ops-propose add` 在 `claude_config/...` 路径上会**直接拒绝**（PROPOSAL_PATH_ALLOWED 白名单）。这是设计意图（前端防脏 + 后端纵深冗余）。
+
+所以 B.3 BLOCK 测试需要**直接在宿主机手写 manifest + request**，绕过 helper 前端，让 watcher 真处理一个 BLOCK 路径的 proposal。这恰好测的是设计文档里"watcher 不信任 helper"那条原则——如果 helper 有 bug / 被绕过 / 有人手写攻击，watcher 后端是否还能拦住。
+
+详细操作命令在本次会话的对话历史中（chat agent 已给过 jq -n 拼 manifest 的完整脚本，不再重抄）。下窗口直接读会话尾部"BLOCK 档预设计"段即可。
+
+预期：
+
+```
+status=blocked
+risk_level=BLOCK
+reason="changes path 'claude_config/hooks/guard.sh' touches BLOCK invariant ..."
+events.jsonl: "BLOCK path detected" + "telegram sent kind=proposal status=blocked risk=BLOCK http_code=200"
+.notified.txt 新增: <id>:blocked:BLOCK
+手机收到 🚨 通知（"BLOCKED · agent attempted invariant touch"）
+```
+
+### 还没做（B.3 / B.4）
+
+- B.3 proposal 4 档的最后一格：BLOCK（待下窗口）
+- B.3 失败路径主动测试（关 SR / 假端口 → LOW proposal → events.jsonl http_code=000 + `.notified.txt` 不污染）
+- B.3 lifecycle stopped（Ctrl-C；watcher 当前仍前台跑着，PID 38521）
+- B.4 launchd plist 开机自启 + heartbeat 端到端覆盖 fswatch tick miss 局限
+
+### 现场状态（写本段时）
+
+- watcher 仍前台 polling 跑着，PID 38521
+- 累计已发送：started ×1 / disabled ×1 / resumed ×1 / heartbeat 多条 / proposal accepted ×3 / heartbeat send failed ×1（用户切 SR 那次，已恢复）
+- `.notified.txt` 三行（见上）
+- `ops-results/` 累计 11 份 result（B.1 时代 9 个老的 + B.3 新增 LOW/MEDIUM/HIGH 三个）
+- `effective_status` 全场视角：除 122027 / 122337 / 9048d1 三个 accepted_for_review 占位外，其他全部已闭合
