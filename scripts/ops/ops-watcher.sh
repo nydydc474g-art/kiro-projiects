@@ -570,7 +570,7 @@ check_heartbeat() {
   # 收集状态：snapshot id / 待处理 request / 最近一次 result
   local snap_id queue last_proposal
   snap_id=$(cat "$SNAPSHOT_DIR/.snapshot-id" 2>/dev/null || echo "unknown")
-  queue=$(ls "$REQUESTS_DIR"/*.json 2>/dev/null | wc -l | tr -d ' ')
+  queue=$(find "$REQUESTS_DIR" -maxdepth 1 -type f -name '*.json' -print 2>/dev/null | wc -l | tr -d ' ')
   last_proposal=$(ls -t "$RESULTS_DIR"/*.json 2>/dev/null | head -1 | xargs -n1 basename 2>/dev/null | sed 's/\.json$//' || echo "")
   [ -z "$last_proposal" ] && last_proposal="none"
   # 截短 ID 显示（取最后 6 位 hex 后缀）
