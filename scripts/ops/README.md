@@ -1,15 +1,16 @@
 # Ops Watcher 脚本目录
 
-> 实施进度：**Step A.1 完成（静态判定内核 + baseline invariant 实装 + candidate 重验）**
+> 实施进度：**Step A.1 完成 + B.0/B.1 完成**（静态判定内核 + agent 容器接入 + snapshot 物理迁移到项目根）
 
 ## 文件清单
 
 | 文件 | 阶段 | 作用 |
 |------|------|------|
-| `init-snapshot.sh` | Phase 1.2 ✅ | 宿主机生成/刷新 `.snapshot/`（versions/current 结构，7 步定序） |
-| `ops-helper.sh` | Phase 1.2 ✅ | agent 容器内 proposal 助手 |
-| `ops-baseline.json` | Step A ✅ | watcher 安全基线（不变量 + 全局禁字段 + 路径白名单） |
-| `ops-watcher.sh` | Step A.1 ✅ | watcher 主循环 + 14 个检查模块（含 baseline invariant + candidate 重验） |
+| `init-snapshot.sh` | Phase 1.2 ✅ | 宿主机生成/刷新 `snapshot/`（versions/current 结构，7 步定序） |
+| `ops-helper.sh` | Phase 1.2 ✅ + B.1 | agent 容器内 proposal 助手；支持 `OPS_SNAPSHOT` 覆盖（宿主机调试用） |
+| `ops-baseline.json` | Step A ✅ + B.1 | watcher 安全基线；`agent_volumes_required` 含 snapshot :ro 挂载 |
+| `ops-watcher.sh` | Step A.1 ✅ + B.1 | watcher 主循环 + 14 个检查模块；启动自检 SNAPSHOT_DIR/current 存在 |
+| `MIGRATION-SOP.md` | B.1 ✅ | snapshot 物理位置迁移手册（Plan C：保留身份 mv） |
 | `verifications/` | Phase 5 ⏳ | 命名检查项目录（待补） |
 | `apply-proposal.sh` | Phase 4 ⏳ | apply/rollback 脚本（待补） |
 
@@ -24,10 +25,10 @@
 
 **两者不重叠 = "只读知情，不可提案改动"**。例：`claude_config/` 在 SNAPSHOT_INCLUDED（agent 看得到当前防线）但不在 PROPOSAL_PATH_ALLOWED，helper 拒绝、watcher 也拒绝。
 
-### .snapshot/ 目录结构
+### snapshot 目录结构（B.1 起的物理布局）
 
 ```
-.snapshot/                          ← 稳定挂载点（compose bind mount 不动）
+~/ai_sandbox/snapshot/              ← 宿主机物理位置（B.1: 从 agent_workspace/.snapshot 迁出）
   versions/
     <snapshot-id-1>/                ← 每次 refresh 创建新版本目录
       .snapshot-id
@@ -35,9 +36,23 @@
       docker-compose.yml
       ...
   current -> versions/<id>          ← 相对 symlink（ln -sfn 原子覆盖）
-  .snapshot-id                       ← 顶层指针，agent helper 直接读
-  .snapshot-hash                     ← 顶层指针
+  .snapshot-id                      ← 顶层指针，agent helper 直接读
+  .snapshot-hash                    ← 顶层指针
+
+# 容器内（agent 视角，不变）
+/app/workspace/.snapshot/           ← 来自 ./snapshot:ro 挂载，嵌套在 :rw workspace 内
 ```
+
+容器内挂载点保持 `/app/workspace/.snapshot`，agent 的 helper 不需要任何
+代码改动。宿主机调试期可显式覆盖：
+
+```bash
+# 宿主机调试
+OPS_SNAPSHOT=~/ai_sandbox/snapshot bash scripts/ops/ops-helper.sh ...
+OPS_SNAPSHOT_DIR=~/ai_sandbox/snapshot bash scripts/ops/ops-watcher.sh --once <id>
+```
+
+详见 `MIGRATION-SOP.md`。
 
 ### 状态流（Step A.1）
 
@@ -162,23 +177,28 @@ bash scripts/ops/ops-watcher.sh --process-all
 bash scripts/ops/ops-watcher.sh --help
 ```
 
-## 验证步骤（Step A）
+## 验证步骤（Step A，宿主机）
+
+> 容器内集成测试见 `MIGRATION-SOP.md` 末尾"smoke test"段。下面是宿主机
+> 直接调用 helper 的快速验证路径——主要给开发期 / 调试期用。
 
 ### 1. 准备
 
 ```bash
 cd ~/ai_sandbox
 bash scripts/ops/init-snapshot.sh
-ls -la agent_workspace/.snapshot/
+ls -la snapshot/                   # B.1 起的新位置（项目根，独立于 agent_workspace）
 ```
 
-### 2. 跑一个合法 LOW proposal
+### 2. 跑一个合法 LOW proposal（宿主机直调 helper）
 
 ```bash
 export WORKSPACE=~/ai_sandbox/agent_workspace
+# B.1: 宿主机调试时显式指向新 snapshot 位置（容器内不需要这个）
+export OPS_SNAPSHOT=~/ai_sandbox/snapshot
 ID=$(bash scripts/ops/ops-helper.sh new "test add tavily")
 mkdir -p $WORKSPACE/ops-proposals/$ID/proxy
-cp $WORKSPACE/.snapshot/current/proxy/allowed_domains.txt $WORKSPACE/ops-proposals/$ID/proxy/
+cp $OPS_SNAPSHOT/current/proxy/allowed_domains.txt $WORKSPACE/ops-proposals/$ID/proxy/
 echo "api.tavily.com" >> $WORKSPACE/ops-proposals/$ID/proxy/allowed_domains.txt
 bash scripts/ops/ops-helper.sh add $ID proxy/allowed_domains.txt
 bash scripts/ops/ops-helper.sh set-effect $ID "agent reaches tavily"
@@ -186,7 +206,7 @@ bash scripts/ops/ops-helper.sh set-affected $ID squid
 bash scripts/ops/ops-helper.sh set-verification $ID squid_denies_example_org
 bash scripts/ops/ops-helper.sh submit $ID
 
-# 让 watcher 处理
+# 让 watcher 处理（OPS_SNAPSHOT_DIR 同样可显式覆盖；watcher 默认也读新位置）
 bash scripts/ops/ops-watcher.sh --once $ID
 
 # 看结果

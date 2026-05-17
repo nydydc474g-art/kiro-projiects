@@ -10,11 +10,17 @@
 #   - PROPOSAL_PATH_ALLOWED 收窄到具体文件白名单
 #   - submit 校验 verification 非空
 #   - submit 拒绝全 no-op 提案
+#
+# B.1 (2026-05-17):
+#   - SNAPSHOT 支持 OPS_SNAPSHOT 环境变量覆盖
+#     容器内默认 /app/workspace/.snapshot（行为不变）
+#     宿主机调试/迁移期可设 OPS_SNAPSHOT=~/ai_sandbox/snapshot 显式指向新位置
 
 set -eo pipefail
 
 WORKSPACE="${WORKSPACE:-/app/workspace}"
-SNAPSHOT="$WORKSPACE/.snapshot"
+# B.1: snapshot 心智模型保持 $WORKSPACE/.snapshot；OPS_SNAPSHOT 仅供宿主机调试/迁移用
+SNAPSHOT="${OPS_SNAPSHOT:-$WORKSPACE/.snapshot}"
 PROPOSALS="$WORKSPACE/ops-proposals"
 REQUESTS="$WORKSPACE/ops-requests"
 RESULTS="$WORKSPACE/ops-results"

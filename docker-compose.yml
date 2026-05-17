@@ -137,6 +137,7 @@ services:
       - /home/developer/.local/state:rw,nosuid,size=128m,uid=1000,gid=1000,mode=0755
     volumes:
       - ./agent_workspace:/app/workspace:rw
+      - ./snapshot:/app/workspace/.snapshot:ro
       - ./claude_config:/app/.claude:ro
       - ./audit_spool:/var/log/audit:ro
     working_dir: /app/workspace
