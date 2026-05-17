@@ -151,31 +151,96 @@ squid 白名单       → 锁死网络出口（不可外联）
 | Telegram 通知 | ✅ watcher 每次执行/拒绝都推通知 | 你手机能实时看到 agent 在干什么基础设施操作 |
 | 人工确认模式 | ❌ 不做 | 违背目标（让 agent 自主闭环），安全靠基线检查兜底 |
 
-### 配置文件方案细节
+### 配置文件方案：为什么 bind mount `.:/project:rw` 风险最小
+
+三个候选方案对比：
+
+| 方案 | agent 能改什么 | 新增风险 |
+|------|---------------|----------|
+| A. 软链接到 workspace | 只有你手动 ln -s 的文件 | 最小，但每次加新文件要你操作，违背自主化目标 |
+| B. bind mount `.:/project:rw` | 整个 ai_sandbox | 中等 |
+| C. 全放 workspace 内 | 整个项目结构在 workspace 里 | 最大（workspace 是 agent 唯一可写目录，混在一起容易误删） |
+
+选 B 的核心论点：**agent 能"写"不等于能"生效"。**
+
+```
+agent 写 /project/docker-compose.yml    → 文件改了，但容器不会自动重启
+agent 写 /project/claude_config/guard.sh → 文件改了，但当前运行时不受影响
+agent 写 /project/proxy/squid.conf      → 文件改了，但 squid 没 reload
+```
+
+所有改动必须经过 watcher 的 rebuild 才能生效 → watcher 执行前做安全基线检查 → 检查不过不执行。
+
+#### 敏感文件（如 guard.sh）的四层防护
+
+| 层 | 机制 | 说明 |
+|----|------|------|
+| 1 | guard.sh 自身路径规则 | agent 用 Bash/Write/Edit 工具改敏感路径 → exit 2 阻断 |
+| 2 | :ro bind mount 覆盖 | CC 运行时读的是 `/app/.claude:ro`，不是 `/project/claude_config/` |
+| 3 | watcher 检查 | rebuild 前可额外验证关键文件 hash |
+| 4 | git diff | 你最终同步生产前 review 所有改动 |
+
+第 1 层在日常就直接挡住，后面三层是纵深冗余。
+
+#### compose 挂载细节
 
 ```yaml
-# compose 中 agent 新增挂载
 volumes:
   - .:/project:rw                        # agent 可改所有配置文件
   - ./agent_workspace:/app/workspace:rw  # 原有工作目录
-  - ./claude_config:/app/.claude:ro      # guard/audit 不可篡改（覆盖 /project 里的同名目录）
+  - ./claude_config:/app/.claude:ro      # guard/audit 不可篡改（后挂载覆盖）
   - ./audit_spool:/var/log/audit:ro      # 审计日志只读
 ```
 
-安全保证：
-- agent 能写 `/project/docker-compose.yml`、`/project/Dockerfile`、`/project/proxy/squid.conf`
-- 但 `/app/.claude/` 由后挂载的 :ro 覆盖，agent 无法通过 `/project/claude_config/` 篡改运行时 guard
-- watcher 白名单基线检查确保 compose 安全字段不变
-- squid.conf 改了要 rebuild 才生效，rebuild 经 watcher 检查
+### 新增服务预注册：为什么不允许自由加服务
 
-### 新增服务预注册
+核心威胁：全局规则覆盖不全时新服务可绕过安全约束。
 
-agent 想加新服务时：
-1. 修改 compose 添加服务定义
-2. 写 request.json `{"action":"register_service","service":"gemini"}`
-3. watcher **拒绝**，response 写："新增服务需人工确认，请通知操作者"
-4. watcher 推 Telegram："agent 请求注册新服务 gemini，请确认"
-5. 你确认后手动加入 watcher 白名单
-6. 后续 agent 可以自由 rebuild/restart 该服务
+```yaml
+# 这三行单独看都不违规，但组合起来开了宿主机端口
+image: alpine
+network_mode: bridge
+ports:
+  - "0.0.0.0:2222:22"
+```
 
-这样 agent 能独立完成新服务的代码编写和配置，只有"首次注册"需要你点头。
+全局规则要覆盖所有危险组合 → 黑名单思路 → 永远有绕过。
+
+预注册成本极低：
+1. agent 写好新服务的 compose 配置
+2. watcher 推 Telegram："agent 请求注册新服务 gemini"
+3. 你看一眼确认（只需确认一次）
+4. 一行命令加入白名单
+5. 后续 agent 自由 rebuild/restart
+
+#### "点错头"会怎样
+
+你误确认了一个恶意服务 → agent 能 rebuild 它 → **但 watcher 仍对所有服务执行全局安全检查**：
+
+- 无 privileged → ✅ 拦截
+- 无 docker.sock → ✅ 拦截
+- 无 cap_add → ✅ 拦截
+- 必须 sandbox_net → ✅ 拦截
+- 无 host 网络/pid/ipc → ✅ 拦截
+- **无 ports 声明** → ✅ 拦截（零端口 publish 是全局约束）
+
+点头只是让 watcher 认识这个服务名，**不是跳过检查**。
+
+最坏后果 = agent 多跑一个无害但无用的容器，浪费一点内存。无安全风险。
+
+### 全局安全检查清单（对所有服务生效，包括新注册的）
+
+```bash
+# watcher 对 compose 文件的全局扫描（任何一项命中即拒绝）
+- privileged: true
+- docker.sock（任何路径形式）
+- cap_add
+- pid: host
+- network_mode: host
+- ipc: host
+- userns_mode: host
+- ports:（零端口 publish 是项目基线）
+- /:/（挂载宿主机根目录）
+- /Users/（挂载用户 home）
+- /var/run/（挂载运行时目录）
+```
