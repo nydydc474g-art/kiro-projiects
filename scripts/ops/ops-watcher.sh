@@ -548,6 +548,8 @@ check_conflict() {
       other_status=$(jq -r '.status' "$RESULTS_DIR/$other.json" 2>/dev/null || echo "unknown")
       # 只有 accepted_for_review 是真正"占位"的；其他终态不视为 conflict
       [ "$other_status" = "accepted_for_review" ] || continue
+      # B.1 fix: 若该 proposal 已被 sibling 标记为 superseded，亦不视为占位
+      [ -f "$RESULTS_DIR/$other.superseded.json" ] && continue
     fi
     pending_ids+=("$other")
   done

@@ -333,3 +333,75 @@ OPS_SNAPSHOT_DIR=~/ai_sandbox/snapshot bash scripts/ops/ops-watcher.sh --once <i
   - 失败不阻断：Telegram POST 失败只写 events.jsonl ERROR
 - B.3 集成测试 SOP（agent 容器内真实跑 ops-propose 全链路）
 - B.4 launchd plist 开机自启（最后做）
+
+
+---
+
+## Checkpoint：B.1 生产实测完成（2026-05-17）
+
+### 现场指纹
+```
+Date:               2026-05-17
+Host:               macOS Mac mini (/Users/caimin/ai_sandbox)
+Docker Server:      29.4.0
+Storage Driver:     overlayfs
+Firewall Backend:   iptables
+DOCKER_INSECURE_NO_IPTABLES_RAW: set (out of scope, flagged for Phase 4)
+```
+
+### 完整证据链（每步都有真实 proposal id 留底）
+
+```
+OLD_ID:     20260517T065529Z (Step A.1 时代遗留)
+SMOKE_ID:   20260517-083443-1e08bc → conflict (老 065617 占位)
+SMOKE2_ID:  20260517-084006-28b44c → accepted_for_review LOW (supersedes 065617)
+NEW_ID:     20260517T085136Z (init-snapshot 后)
+POST_ID:    20260517-085137-2227da → conflict (老 065617 仍占位; B.1 hotfix 修复后会变 accepted)
+```
+
+### 核心目标达成
+
+| 维度 | 证据 |
+|---|---|
+| Plan B 嵌套 :ro 挂载实测成立 | Phase 5 四种写操作全部 `Read-only file system` exit≠0，最后 cat .snapshot-id 仍是 OLD_ID |
+| Plan C 身份保留 mv 成功 | Phase 3 三铆钉对账 + 双向校验全 OK；OLD_ID/HASH/CURRENT 完整保留 |
+| 容器 ops-propose 命令到位 | Phase 6.1 `which` 返回 `/usr/local/bin/ops-propose` (21KB) |
+| watcher 启动自检（compose 改动 + 新挂载 + 新 baseline） | Phase 4.6 rebuild 后 docker compose ps Up，无报错 |
+| refresh 正确性（NEW_ID ≠ OLD_ID + bidirectional） | Phase 7.A.4 全 4/4 OK |
+| bind mount 透明性 | Phase 7.A.6 refresh 后容器立刻读到 NEW_ID/NEW_HASH，无缓存 |
+| 旧世界 happy path（supersedes） | Phase 6.7 SMOKE2 → accepted_for_review LOW + 065617 出现 superseded sibling |
+| 新世界 helper 读到 NEW_ID | Phase 7.B.4 `matches: true`（base_snapshot_id == NEW_ID） |
+
+### macOS Docker Desktop 实测细节
+
+- 嵌套 `:ro` 在 `:rw` 子路径上**实测成立**（virtiofs / overlayfs 后端）
+- 已知诊断噪音：`docker exec agent ls -la /app/workspace/.snapshot/` 输出第一行
+  `ls: ... current: No such file or directory`，但下面照样列出 current symlink
+  完整属性，且 `cat current/...` 完全可用。这是 virtiofs 处理嵌套挂载下 symlink
+  的 lstat-vs-stat 差异，不影响实际功能。下游脚本不要依赖 `ls` 的 exit code
+  判定 current 可用性，应该直接 `readlink` / `cat current/<file>` 验证。
+
+### Step A.1 遗留 bug 在 B.1 实测中暴露并修复
+
+`check_conflict` 判定老 proposal 占位时只看 `<id>.json.status`，不看
+`<id>.superseded.json` sibling。导致已被 supersedes 的老 proposal 在 watcher
+眼里仍然占位，新 proposal 即使显式 set-supersedes 一个**不同的**已 superseded 的
+proposal，仍会撞老的。
+
+修复：`scripts/ops/ops-watcher.sh` `check_conflict` 中 accepted_for_review 判定
+后增加一行 `[ -f "$RESULTS_DIR/$other.superseded.json" ] && continue`。
+4 行 hotfix，含注释。bash -n 通过。
+
+### 还没做（B.2-B.4）
+
+- B.2 Telegram 单向摘要通知（独立 .ops-watcher.env，权限不对则降级不崩）
+- B.3 集成测试 SOP（agent 容器内真实跑 ops-propose 全链路）
+- B.4 launchd plist 开机自启（最后做）
+
+### MIGRATION-SOP.md 已发现的小问题（待 B.2 顺手修）
+
+1. `docker compose up -d agent` 不会 rebuild 镜像；新 ops-propose 不会进容器。
+   正确做法：`docker compose build agent && docker compose up -d agent`。
+   B.1 实测中通过 Phase 4.6 增补步骤修正。
+2. zsh 默认不识别 `# 注释`，命令块顶部用 `# ===` 装饰行会让 zsh 把分隔字符
+   当命令名报 not found。SOP 应避免此风格，或显式 `setopt interactive_comments`。
