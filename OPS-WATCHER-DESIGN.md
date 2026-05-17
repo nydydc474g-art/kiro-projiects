@@ -505,3 +505,68 @@ rm ~/ai_sandbox/.ops-watcher.disabled
 - agent rebuild agent 会杀掉自己当前会话：可接受，新容器正常启动
 - 新增服务首个 proposal 仍需通过通用 HIGH 流程（不需要单独"预注册"步骤——HIGH 的 `--high` 显式确认即可）
 - watcher 自身的 bug 是宿主机级风险点：脚本要求保持极简，所有外部输入经 jq 解析（无 eval），所有路径经白名单校验
+
+
+
+---
+
+## Checkpoint：Phase 1 完成（2026-05-17）
+
+- `scripts/ops/init-snapshot.sh`：宿主机生成 `.snapshot/`，严格白名单复制（不含 .env/.git/auths/audit_spool）
+- `scripts/ops/ops-helper.sh`：agent 容器内 `ops-propose` 命令（new/add/set-*/submit/result/list）
+- `scripts/ops/README.md`：进度记录 + 验证步骤
+
+待办（Phase 1.1，进入 Phase 2 前必修）：
+
+### 路径与白名单
+1. SNAPSHOT_INCLUDED vs PROPOSAL_PATH_ALLOWED 概念澄清
+2. ops-helper add 路径白名单校验，敏感路径（claude_config 等）helper 层先拒绝
+
+### Manifest 完整性
+3. jq -n 生成初始 manifest（防引号注入）
+4. 原子更新（mktemp + mv + trap）
+5. add 去重 by path
+6. add 计算并写入 sha256
+7. validate 顺手清理陈旧 `.manifest.*`
+
+### Submit 严格校验
+8. `jq empty` 验合法 JSON
+9. `base_snapshot_id != "unknown"`
+10. `changes[].path` 文件存在
+11. `reason` 非空
+12. `expected_effect` 非空
+13. `affected_services` 非空且元素均在白名单
+
+### 命令与体验
+14. 独立 `validate` 命令
+15. usage 补 set-effect 和 validate
+16. `clean` 命令（仅 draft + changes 空 + 24h 前，不动有 changes 的半成品）
+
+### Snapshot 强化
+17. init-snapshot.sh 原子刷新（mktemp -d → rsync → mv）
+18. `.snapshot-hash` 内容哈希（防同秒重刷/手工改 snapshot）
+19. proposal id 加短随机后缀防同秒冲突
+
+### Result 不可变性（J 终稿）
+20. result 内嵌 manifest 完整副本
+21. result 内嵌 applied_files 与 sha256
+22. result 单文件只读，后续状态走 sibling（如 `<id>.rollback.json`）
+
+### 设计澄清
+
+**SNAPSHOT_INCLUDED vs PROPOSAL_PATH_ALLOWED**
+
+| 维度 | 含义 |
+|------|------|
+| SNAPSHOT_INCLUDED | agent 通过 `.snapshot/` 可读的"生产现状" |
+| PROPOSAL_PATH_ALLOWED | manifest.changes[].path 允许的白名单 |
+
+两者**不重叠** = "只读知情，不可提案改动"。
+
+例如 `claude_config/`：
+- ✅ 在 SNAPSHOT_INCLUDED：agent 能看到当前 guard.sh / audit.sh / settings.json，理解防线现状
+- ❌ 不在 PROPOSAL_PATH_ALLOWED：agent 无法提案改动这些文件
+- helper 在 `add` 阶段就拒绝（前端防脏）
+- watcher 仍保留 BLOCK 检测（后端不信任前端，纵深冗余）
+
+下一步：Phase 1.1 完成后进入 Phase 2（compose 挂载 + watcher 主循环 + 风险分级）。
