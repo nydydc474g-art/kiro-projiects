@@ -1086,19 +1086,22 @@ snapshot=20260517T... queue=0 last=2e08a7
 
 ---
 
-## Checkpoint：B.2 hotfix 生产实测通过（2026-05-17）
+## Checkpoint：B.2 hotfix 沙箱完成；生产仍未实测（2026-05-17）
 
-`ops-watcher-step-b-hotfix` 分支 5d4d6b4 在生产宿主机实测：
-- 拉新代码 + `sed` 改 env 一行（HTTPS_PROXY → TELEGRAM_PROXY_URL）+ 重启 watcher
-- 手机收到 `ℹ️ ops-watcher started (snapshot=20260517T085136Z)`
+> **重要更正**：先前在此处写过"生产实测通过"+ "确认 hotfix 三件事一次通过"
+> 是错误叙述，已纠正。事实如下，详细经过见 `HANDOFF-OPS-WATCHER.md`
+> 同名 checkpoint。
 
-确认 hotfix 三件事一次通过：
+事实：
+- B.2 hotfix（5d4d6b4）只在沙箱完成代码；hotfix 代码尚未在生产宿主机上跑过
+- 生产机当晚收到 `started` 是因为用户手动改 `.ops-watcher.env` 端口
+  1086→1082，重启的仍是 B.2 沙箱稿（5ce4c9b 上的 `ops-watcher-step-b`），
+  那一份代码用的是全局 `HTTPS_PROXY` 路径
+- 由此能确认：端口飘移是根因；沙箱稿在端口正确时工作正常
+- 不能确认：hotfix 三件事（`TELEGRAM_PROXY_URL` 专用变量 /
+  `LAST_TELEGRAM_HTTP_CODE` 诊断 / `check_heartbeat`）在生产机上是否如设计工作
 
-1. `TELEGRAM_PROXY_URL=http://127.0.0.1:1082` 替代过期的 `HTTPS_PROXY=...:1086`
-2. `LAST_TELEGRAM_HTTP_CODE` 已暴露（events.jsonl 后续可看到 http_code 字段）
-3. heartbeat 6h 间隔已注入主循环
-
-### 排查教训（设计层面）
+### 排查教训（设计层面，仍然成立）
 
 watcher.B.2 原版有一个开发债：`send_telegram_raw` 抛掉 curl 的 http_code，
 events.jsonl 只看到"telegram send failed"几个字。这导致后来诊断"是代理失败/
@@ -1106,6 +1109,11 @@ token 失败/还是网络问题"全靠外部对照测，绕远了。
 
 **设计原则补充**：失败路径必须保留足够诊断信息。任何"调用了外部 API 然后返回 1"
 的函数，都应该在调用方可见的位置记录"为什么失败"，不只是"失败了"。
-hotfix 已修。
+hotfix 已写但还没生产实证。
 
-### B.3 / B.4 待办（不变，详见 HANDOFF-OPS-WATCHER.md 末段清单）
+### B.2 hotfix cutover + B.3 / B.4 待办
+
+详见 `HANDOFF-OPS-WATCHER.md` 末段：
+- B.2 hotfix cutover SOP（拉 hotfix 分支代码 + sed 改 env 变量名 + 重启）
+- B.3 完整生产实测 SOP（lifecycle 4 档 / proposal 4 档 / heartbeat / 失败路径）
+- B.4 launchd 自启

@@ -6,13 +6,30 @@
 
 ---
 
-## 一句话现状
+## ⚠️ 最新进度指针（覆盖以下旧入口，2026-05-17）
+
+> **本文件追加式更新，前文不重写。**
+> 如果你是新窗口的 agent，先读这一段定位进度，再按指引跳到末段。
+
+- 当前最新分支：`ops-watcher-step-b-hotfix`（B.2 hotfix 沙箱完成，**生产未实测**）
+- 生产宿主机当前实际跑的：`ops-watcher-step-b` 上的 5ce4c9b（B.2 沙箱稿）
+- env 当前形态：`HTTPS_PROXY=http://127.0.0.1:1082`（端口已新，变量名仍旧）
+- 下窗口最先要做的事：按本文件最末 **「下窗口必跑：Cutover SOP」** 章节的步骤
+  把 hotfix 搬到生产 + 实测 started，再做 B.3
+- 真实进度详情：见末段 `Checkpoint：B.2 hotfix 沙箱完成；生产仍未实测（2026-05-17）`
+
+跳转：[末段 Cutover SOP](#下窗口必跑cutover-sop拉-hotfix--改-env--重启) ·
+[B.3 完整测试清单](#b3-完整测试清单下窗口要做)
+
+---
+
+## 一句话现状（历史快照，已被上方指针覆盖）
 
 Watcher 静态判定内核已生产实测通过：proposal 提交 → 14 项静态检查 → 写权威结果 + 单行路标 + 审计流。**还没接 Telegram，还没改 compose，还没让 agent 容器真正能用 ops-propose。**
 
 ---
 
-## 给下个窗口的第一句话
+## 给下个窗口的第一句话（历史快照，已被上方指针覆盖）
 
 > "继续 ops-watcher 项目的 Step B。读 `OPS-WATCHER-DESIGN.md` 与 `HANDOFF-OPS-WATCHER.md`，然后实施 Step B。"
 
@@ -545,6 +562,22 @@ B.2 沙箱完成、生产首次实测：手机收不到 started，events.jsonl �
 > 不是 watcher bug**。修复方案：B.4 launchd plist 加启动顺序约束 + heartbeat
 > 心跳作为侧面信号（heartbeat 间隔内代理上线后第一个 tick 就有信号）。
 
+### 前置事实（下窗口拉 hotfix 之前必读）
+
+B.2 沙箱稿（5ce4c9b，分支 `ops-watcher-step-b`）首次生产实测时，
+用户**手动把 `.ops-watcher.env` 里的代理端口从 1086 改为 1082**
+（修了 SR 端口飘移）然后重启旧 watcher 才收到 started。所以生产机
+当前 env 内容是：
+
+```
+HTTPS_PROXY=http://127.0.0.1:1082
+```
+
+**端口已是新值，但变量名仍是旧的 `HTTPS_PROXY`**。下面 SOP 里的
+`sed -i '' 's|^HTTPS_PROXY=|TELEGRAM_PROXY_URL=|'` 只替换变量名，
+端口和值原样保留，所以 SOP 仍然正确。下窗口拿到这个 env 直接跑 SOP
+即可，不要再额外改端口。
+
 ### 用户操作（生产机最小动作）
 
 ```bash
@@ -577,17 +610,26 @@ bash "$SANDBOX/scripts/ops/ops-watcher.sh"
 
 ---
 
-## Checkpoint：B.2 hotfix 生产实测通过（2026-05-17）
+## Checkpoint：B.2 hotfix 沙箱完成；生产仍未实测（2026-05-17）
 
-```
-manifest 拉新代码 → sed 改 .ops-watcher.env 一行 → 重启 watcher
-↓
-手机收到：ℹ️ ops-watcher started (snapshot=20260517T085136Z)
-```
+> **重要更正**：先前在此处写过"生产实测通过"+ "hotfix 三件事一次落地全过"
+> 是错误叙述，已纠正。事实如下。
 
-hotfix 三件事一次落地全过：`TELEGRAM_PROXY_URL` + `LAST_TELEGRAM_HTTP_CODE`
-诊断 + heartbeat。配置层（端口 1082）+ 代码层（专用变量 + http_code 暴露 +
-心跳）一起到位。
+### 真实状态
+
+- B.2 hotfix（5d4d6b4）**只在沙箱完成代码**；hotfix 代码本身**尚未在生产
+  宿主机上跑过**
+- 生产机当晚收到 `started` 通知是另一条路径触发的：用户**手动把
+  `.ops-watcher.env` 的代理端口从 1086 改为 1082**（修了 SR 端口飘移），
+  **重启的仍是 B.2 沙箱稿（5ce4c9b 上的 `ops-watcher-step-b` 旧 watcher）**，
+  那一份代码用的是全局 `HTTPS_PROXY` 路径
+- 由此能确认的只有两件事：
+  1. 端口飘移（1086 → 1082）确实是 started 不出的根因
+  2. 旧 watcher（B.2 沙箱稿 + `HTTPS_PROXY` 路径）在端口正确时工作正常
+- **不能确认**的：hotfix 三件事（`TELEGRAM_PROXY_URL` 专用变量 /
+  `LAST_TELEGRAM_HTTP_CODE` 诊断 / `check_heartbeat`）在生产机上是否如设计工作
+- 生产机 `.ops-watcher.env` 当前内容是 `HTTPS_PROXY=http://127.0.0.1:1082`
+  （旧变量名 + 新端口），不是 `TELEGRAM_PROXY_URL=...`
 
 ### 排查回血记录（以防再现类似问题）
 
@@ -633,7 +675,8 @@ HTTPS_PROXY=http://127.0.0.1:1082 经 getMe → ok:true
 3. 只有 `000` 才需要进一步分层诊断（nc / curl --noproxy / curl 别的域名）
 
 这里的关键教训：**给失败路径足够的诊断信息是不可妥协的**。`telegram send failed`
-不带 http_code = 把所有失败模式合并成一个，浪费定位时间。hotfix 已修。
+不带 http_code = 把所有失败模式合并成一个，浪费定位时间。hotfix 代码已写
+（5d4d6b4），但还没在生产机上跑过——见上方更正段。
 
 #### 我的反思（chat-agent 反复回头记录）
 
@@ -655,21 +698,30 @@ HTTPS_PROXY=http://127.0.0.1:1082 经 getMe → ok:true
 
 ```
 main
-└── ops-watcher-step-b               ← Step A + A.1 + B.0 + B.1 + B.2 沙箱稿（未生产实测）
-    └── ops-watcher-step-b-hotfix    ← B.2 hotfix（已生产实测通过 ★ 当前推荐分支）
+└── ops-watcher-step-b               ← Step A + A.1 + B.0 + B.1 + B.2 沙箱稿
+    │                                  生产宿主机当前实际跑的就是这一份代码
+    │                                  （5ce4c9b，env 是 HTTPS_PROXY=...:1082）
+    └── ops-watcher-step-b-hotfix    ← B.2 hotfix 沙箱完成，未生产实测
+        commit d1a1210 — docs: branch topology + B.3 checklist + cutover SOP
         commit 5d4d6b4 — TELEGRAM_PROXY_URL + http_code 诊断 + heartbeat
         commit 5ce4c9b — feat(B.2): Telegram one-way summary notifications
 ```
 
-**生产宿主机当前运行的代码 = `ops-watcher-step-b-hotfix` 分支 5d4d6b4**。
-config: `~/ai_sandbox/.ops-watcher.env` 含 `TELEGRAM_PROXY_URL=http://127.0.0.1:1082`。
+**生产宿主机当前运行的代码 = `ops-watcher-step-b` 分支 5ce4c9b（B.2 沙箱稿）**。
+config: `~/ai_sandbox/.ops-watcher.env` 当前是 `HTTPS_PROXY=http://127.0.0.1:1082`。
+
+下窗口的第一件事是按本文件下方的 **Cutover SOP** 把 hotfix 真正搬到生产机
+（拉代码 → sed 改 env 变量名 → 重启 watcher），实测通过后再做 B.3。
 
 ### 给下个窗口的入口指令
 
-> "继续 ops-watcher 项目的 Step B.3。读 `OPS-WATCHER-DESIGN.md` 与
-> `HANDOFF-OPS-WATCHER.md`，然后实施 B.3 完整生产实测 SOP。
-> 当前分支：`ops-watcher-step-b-hotfix`。生产已运行此分支代码，started
-> 通知收到了，但 lifecycle 4 档 + proposal 4 档 + heartbeat 都还没系统测过。"
+> "继续 ops-watcher 项目的 Step B.2 hotfix cutover + B.3。读
+> `OPS-WATCHER-DESIGN.md` 与 `HANDOFF-OPS-WATCHER.md`，**先按 Cutover SOP
+> 把 hotfix 搬到生产机并实测过 started 一次**，再实施 B.3 完整生产实测 SOP。
+> 当前生产分支：`ops-watcher-step-b`（沙箱稿，B.2 hotfix 尚未在生产机跑过）。
+> hotfix 代码在 `ops-watcher-step-b-hotfix` 分支等待搬迁。已知事实：端口飘移
+> 1086→1082 是 started 不出的根因，沙箱稿 + 1082 端口下 started 工作。
+> hotfix 三件事（专用代理变量 / http_code 诊断 / heartbeat）尚未在生产实证。"
 
 ### B.3 完整测试清单（下窗口要做）
 
@@ -724,3 +776,64 @@ snapshot=... queue=... last=...
 - fswatch 模式长时间无 proposal 流量会错过 heartbeat tick（B.4 launchd 重构时再改）
 - launchd 自启时若 SR 还没起来，started 通知会丢——主流程不受影响（B.4 加启动顺序约束）
 - `kill -9` / OOM kill 不触发 stopped 通知——这是设计内盲区，靠 heartbeat 兜底
+
+
+
+---
+
+## 下窗口必跑：Cutover SOP（拉 hotfix → 改 env → 重启）
+
+> 本节是把上方"Checkpoint：B.2 hotfix（2026-05-17）"段里的"用户操作（生产机最小动作）"
+> 提到末段独立成节，方便下窗口直接落地。SOP 与那一段保持完全一致。
+
+### 前置事实（必读）
+
+生产机 `.ops-watcher.env` 当前内容是：
+
+```
+HTTPS_PROXY=http://127.0.0.1:1082
+```
+
+**端口已是新值（1082，不是过期的 1086），但变量名仍是旧的 `HTTPS_PROXY`**。
+这是因为 B.2 沙箱稿首次实测时用户当晚只手动改了端口、没换变量名，重启的还是
+旧 watcher。下面的 `sed` 命令只替换变量名，端口和值原样保留——不需要再额外
+改端口。
+
+### Cutover 三步
+
+```bash
+SANDBOX=/Users/caimin/ai_sandbox
+BASE=https://raw.githubusercontent.com/nydydc474g-art/kiro-projiects/ops-watcher-step-b-hotfix
+
+# 1. 拉 hotfix 代码（脚本 + env 模板）
+curl -fsSL "$BASE/scripts/ops/ops-watcher.sh" -o "$SANDBOX/scripts/ops/ops-watcher.sh"
+curl -fsSL "$BASE/scripts/ops/.ops-watcher.env.example" -o "$SANDBOX/scripts/ops/.ops-watcher.env.example"
+chmod +x "$SANDBOX/scripts/ops/ops-watcher.sh"
+
+# 2. 改 .ops-watcher.env：把 HTTPS_PROXY=http://127.0.0.1:1082 改成
+#    TELEGRAM_PROXY_URL=http://127.0.0.1:1082（端口和值不动，只换变量名）
+sed -i '' 's|^HTTPS_PROXY=|TELEGRAM_PROXY_URL=|' "$SANDBOX/.ops-watcher.env"
+chmod 600 "$SANDBOX/.ops-watcher.env"
+cat "$SANDBOX/.ops-watcher.env"   # 确认是 TELEGRAM_PROXY_URL=http://127.0.0.1:1082
+
+# 3. Ctrl-C 现在跑着的旧 watcher（B.2 沙箱稿），重启
+bash "$SANDBOX/scripts/ops/ops-watcher.sh"
+```
+
+### 期望结果
+
+- 手机收到：`ℹ️ ops-watcher started (snapshot=...)`
+- `tail -3 ~/ai_sandbox/ops_spool/events.jsonl | jq -c .` 出现：
+  - `lvl=info` `msg="telegram sent"` `kind=lifecycle` `event=started` `http_code=200`
+
+如果 http_code != 200：见上方"Checkpoint：B.2 hotfix 沙箱完成；生产仍未实测"
+段的"排查回血记录"诊断分层（000 / 401 / 400 / 429）。
+
+### 完成后再做
+
+cutover 实测通过后，按上方"### B.3 完整测试清单（下窗口要做）"逐项验证：
+lifecycle 4 档边沿 → proposal 4 档（status × risk matrix）→ heartbeat（用
+`OPS_HEARTBEAT_INTERVAL=60` 加速）→ 失败路径（`.notified.txt` 不被污染）。
+
+B.3 全部通过后，再开 B.4（launchd plist 自启），把 fswatch tick miss /
+launchd race / kill -9 silent gap 三条已知约束在 plist 设计里兜住。
