@@ -1168,3 +1168,168 @@ events.jsonl: "BLOCK path detected" + "telegram sent kind=proposal status=blocke
 - `.notified.txt` 三行（见上）
 - `ops-results/` 累计 11 份 result（B.1 时代 9 个老的 + B.3 新增 LOW/MEDIUM/HIGH 三个）
 - `effective_status` 全场视角：除 122027 / 122337 / 9048d1 三个 accepted_for_review 占位外，其他全部已闭合
+
+
+
+
+---
+
+## 下窗口必跑：B.3 BLOCK 档测试 SOP
+
+> 自包含命令脚本，下窗口不需要回看对话历史。
+> 上方 `Checkpoint：B.3 proposal 3/4 档实证` 末尾的"BLOCK 档预设计"段说明了
+> 设计意图（"watcher 不信任 helper"原则的二轮实证）；本节是直接可执行的命令。
+
+### 前置条件
+
+- watcher 仍在前台 polling 跑着（PID 38521；如已停，先按 cutover SOP 重启）
+- env 是 `TELEGRAM_PROXY_URL=http://127.0.0.1:1082`，SR 在 1082 端口
+- 当前 `.notified.txt` 应该已有 3 行（LOW/MEDIUM/HIGH 各一）
+- B.3 LOW/MEDIUM/HIGH 三档已通过
+
+### 设计核心：为什么不能用 helper 前端
+
+`PROPOSAL_PATH_ALLOWED` 白名单在 helper `add` 阶段就拒绝 `claude_config/...`
+路径——这是设计意图（前端防脏）。但 watcher 后端**也**有独立的 BLOCK 检测
+（`check_block_paths`，第 3 道闸门）作为纵深冗余。
+
+B.3 BLOCK 测试**故意绕过 helper**直接手写 manifest + request 投到
+`agent_workspace/`，模拟"helper 有 bug / 被绕过 / 有人手写攻击"的场景，验证
+watcher 后端在没有前端协助时仍能拦截。
+
+### 操作脚本（宿主机一次性粘贴）
+
+watcher 不动。**新开一个终端**（macOS Cmd+T），里面跑：
+
+```bash
+setopt interactive_comments 2>/dev/null || true   # zsh 兼容 # 注释
+
+SANDBOX=/Users/caimin/ai_sandbox
+
+# 1. 生成 BLOCK proposal id（手动构造，不用 helper）
+NOW=$(date -u +"%Y%m%d-%H%M%S")
+RAND=$(LC_ALL=C od -An -N3 -tx1 /dev/urandom | tr -d ' \n')
+NEW_BLOCK_ID="${NOW}-${RAND}"
+echo "BLOCK ID: $NEW_BLOCK_ID"
+
+# 2. 拼一个最小 manifest，path 故意落在 BLOCK 路径上
+PROPOSAL_DIR="$SANDBOX/agent_workspace/ops-proposals/$NEW_BLOCK_ID"
+mkdir -p "$PROPOSAL_DIR/claude_config/hooks"
+
+# 候选文件（内容随便，反正会在 BLOCK paths 闸门就被拒）
+echo "# B.3 BLOCK smoke (should never apply)" > "$PROPOSAL_DIR/claude_config/hooks/guard.sh"
+
+# 算 sha256
+SHA=$(shasum -a 256 "$PROPOSAL_DIR/claude_config/hooks/guard.sh" | awk '{print $1}')
+
+# 当前 snapshot id/hash
+SNAP_ID=$(cat "$SANDBOX/snapshot/.snapshot-id")
+SNAP_HASH=$(cat "$SANDBOX/snapshot/.snapshot-hash")
+
+# 写 manifest（jq -n 防引号注入）
+jq -n \
+  --arg id "$NEW_BLOCK_ID" \
+  --arg sid "$SNAP_ID" \
+  --arg shash "$SNAP_HASH" \
+  --arg sha "$SHA" \
+  '{
+    proposal_id: $id,
+    base_snapshot_id: $sid,
+    base_snapshot_hash: $shash,
+    supersedes: null,
+    reason: "B.3 BLOCK smoke: try to touch claude_config/hooks/guard.sh",
+    expected_effect: "should be BLOCKED at check_block_paths",
+    affected_services: ["agent"],
+    rebuild_strategy: "minimal",
+    changes: [{
+      path: "claude_config/hooks/guard.sh",
+      type: "modify",
+      summary: "comment line",
+      sha256: $sha
+    }],
+    verification: ["smoke_test_marker"]
+  }' > "$PROPOSAL_DIR/manifest.json"
+
+# 3. 写 request 触发 watcher（必须最后写，否则 watcher 看到的 proposal 不完整）
+echo "{}" > "$SANDBOX/agent_workspace/ops-requests/${NEW_BLOCK_ID}.json"
+
+echo "submitted: $NEW_BLOCK_ID"
+echo "wait 5 seconds for watcher polling tick..."
+sleep 5
+
+# 4. 看结果
+echo "=== result ==="
+cat "$SANDBOX/agent_workspace/ops-results/${NEW_BLOCK_ID}.json" 2>/dev/null \
+  | jq '{id:.proposal_id, status, risk_level, reason}'
+echo
+echo "=== events tail (10) ==="
+tail -10 "$SANDBOX/ops_spool/events.jsonl" | jq -c .
+echo
+echo "=== notified.txt ==="
+cat "$SANDBOX/ops_spool/.notified.txt"
+```
+
+### 预期结果
+
+```
+result:
+  status      = "blocked"
+  risk_level  = "BLOCK"
+  reason      = "changes path 'claude_config/hooks/guard.sh' touches BLOCK invariant (matches: ...)"
+
+events.jsonl 末尾依次出现：
+  "processing request" proposal_id=<NEW_BLOCK_ID>
+  "BLOCK path detected: changes path '...guard.sh' touches BLOCK invariant ..."
+  "telegram sent" kind=proposal status=blocked risk=BLOCK http_code=200
+
+.notified.txt 应该新增第 4 行：
+  <NEW_BLOCK_ID>:blocked:BLOCK
+```
+
+手机预期收到 🚨 BLOCKED 通知，文案大致：
+
+```
+🚨 BLOCKED · ops <short> — agent attempted invariant touch
+   reason: changes path 'claude_config/hooks/guard.sh' touches BLOCK invariant ...
+   path: claude_config/hooks/guard.sh
+   audit: ops-spool view <short>
+   (no apply — review agent behavior)
+```
+
+注意：BLOCK 通知**没有** apply 命令，这是设计——BLOCKED 不可审批。
+
+### 测完贴回这三样
+
+```
+1. NEW_BLOCK_ID 是什么
+2. result 的 status / risk_level / reason
+3. .notified.txt 末尾两行（应该是 HIGH 9048d1 和新 BLOCK 这两条）
+4. 手机有没有收到 🚨 通知
+```
+
+### B.3 / B.4 待办（BLOCK 通过后剩下）
+
+- B.3 失败路径主动测试（关 SR 或改 env 假端口 → 触发 LOW proposal → 验证
+  events.jsonl 出现 `http_code=000` + `.notified.txt` **不**追加新行 →
+  恢复 SR → 重提验证 `.notified.txt` 这时才追加）
+- B.3 lifecycle stopped（Ctrl-C watcher → 手机收到 ℹ️ stopped 通知 +
+  events.jsonl 出现 `event=stopped http_code=200`）
+- B.4 launchd plist 开机自启 + heartbeat 端到端覆盖 fswatch tick miss
+
+### 设计意图回顾（如果 BLOCK 通过 / 失败时）
+
+**通过**：watcher 后端 BLOCK 检测在 helper 前端被绕过的场景下仍然守住
+不变量。"watcher 不信任 helper"原则在生产实证。这是整个 status × risk
+matrix 的最后一格，也是 B.3 集成测试的收尾——闭合 5/5。
+
+**失败（不太可能但可能）**：BLOCK 检测有 bug 或路径正则没覆盖
+`claude_config/hooks/...`，需要看 `scripts/ops/ops-baseline.json` 的
+`block_paths_in_changes_regex` 字段确认覆盖范围，必要时改正则后重测。
+
+测试痕迹清理（BLOCK proposal 是测试产物，但不影响后续——blocked 状态
+是闭合状态，不占位）：
+- `ops-results/<id>.json` 留着作审计证据，不删
+- `ops-results/<id>.blocked.BLOCK.summary` 留着
+- `ops-requests/.processed/<id>.json` 留着
+- `ops-proposals/<id>/` 留着（已归档到 `ops_spool/proposals/<id>/`）
+- 不需要清理任何东西
