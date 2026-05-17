@@ -32,11 +32,28 @@ kiro-projiects/
         ├── ops-helper.sh
         ├── ops-watcher.sh
         ├── ops-baseline.json
+        ├── MIGRATION-SOP.md  ← B.1 snapshot relocation playbook
         └── README.md
 ```
 
 Each Dockerfile carries a banner comment naming the service it builds, so
 agents (and humans) cannot confuse them when grepping the tree.
+
+## Host-side runtime layout
+
+The repository is the build source. At runtime the production host adds two
+peer directories that are not git-tracked here:
+
+```
+~/ai_sandbox/                      (production host root)
+├── kiro-projiects/                ← this repo
+├── snapshot/                      ← watcher product (B.1+); read-only mount source for agent
+└── agent_workspace/               ← agent rw mount source; independent git repo
+```
+
+Agent container view is unchanged across this layout: `/app/workspace`
+(rw, from `agent_workspace/`) with `/app/workspace/.snapshot` (ro, from
+`snapshot/`) nested inside it.
 
 ## docker-compose service → Dockerfile mapping
 

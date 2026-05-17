@@ -32,7 +32,9 @@ set -eo pipefail
 # ===== 配置 =====
 PROJECT_DIR="${PROJECT_DIR:-$HOME/ai_sandbox}"
 WORKSPACE_DIR="$PROJECT_DIR/agent_workspace"
-SNAPSHOT_DIR="$WORKSPACE_DIR/.snapshot"
+# B.1: snapshot 物理位置从 agent_workspace/.snapshot/ 迁到 project root snapshot/
+# OPS_SNAPSHOT_DIR 用于宿主机迁移期/调试时显式覆盖
+SNAPSHOT_DIR="${OPS_SNAPSHOT_DIR:-$PROJECT_DIR/snapshot}"
 PROPOSALS_DIR="$WORKSPACE_DIR/ops-proposals"
 REQUESTS_DIR="$WORKSPACE_DIR/ops-requests"
 RESULTS_DIR="$WORKSPACE_DIR/ops-results"
@@ -93,6 +95,31 @@ load_baseline() {
   fi
   if ! jq empty "$BASELINE_FILE" 2>/dev/null; then
     echo "FATAL: baseline file is not valid JSON: $BASELINE_FILE" >&2
+    exit 1
+  fi
+}
+
+# 启动自检：snapshot 目录存在且已初始化
+# B.1: 提早失败 — 否则第一个 proposal 才会因为 snap_id=unknown 一路飘到 stale，事后难定位
+check_snapshot_dir() {
+  if [ ! -d "$SNAPSHOT_DIR" ]; then
+    echo "FATAL: SNAPSHOT_DIR does not exist: $SNAPSHOT_DIR" >&2
+    echo "       run: bash scripts/ops/init-snapshot.sh" >&2
+    echo "       (or set OPS_SNAPSHOT_DIR to point at an existing snapshot tree)" >&2
+    exit 1
+  fi
+  if [ ! -e "$SNAPSHOT_DIR/current" ]; then
+    echo "FATAL: $SNAPSHOT_DIR/current missing — snapshot not initialized" >&2
+    echo "       run: bash scripts/ops/init-snapshot.sh" >&2
+    exit 1
+  fi
+  if [ ! -L "$SNAPSHOT_DIR/current" ]; then
+    echo "FATAL: $SNAPSHOT_DIR/current is not a symlink (manual repair needed)" >&2
+    exit 1
+  fi
+  if [ ! -f "$SNAPSHOT_DIR/.snapshot-id" ] || [ ! -f "$SNAPSHOT_DIR/.snapshot-hash" ]; then
+    echo "FATAL: top-level snapshot metadata missing (.snapshot-id / .snapshot-hash)" >&2
+    echo "       run: bash scripts/ops/init-snapshot.sh" >&2
     exit 1
   fi
 }
@@ -1011,9 +1038,11 @@ list_pending_requests() {
 main_loop() {
   ensure_dirs
   load_baseline
-  write_event "info" "watcher started" "" "$(jq -n --arg pd "$PROJECT_DIR" '{project_dir: $pd}')"
+  check_snapshot_dir
+  write_event "info" "watcher started" "" "$(jq -n --arg pd "$PROJECT_DIR" --arg sd "$SNAPSHOT_DIR" '{project_dir: $pd, snapshot_dir: $sd}')"
 
   echo "[ops-watcher] PROJECT_DIR=$PROJECT_DIR"
+  echo "[ops-watcher] SNAPSHOT_DIR=$SNAPSHOT_DIR"
   echo "[ops-watcher] watching $REQUESTS_DIR"
   echo "[ops-watcher] press Ctrl-C to stop"
 
@@ -1048,11 +1077,13 @@ case "${1:-}" in
     [ -z "${1:-}" ] && { echo "Usage: ops-watcher.sh --once <request-id>" >&2; exit 1; }
     ensure_dirs
     load_baseline
+    check_snapshot_dir
     process_request "$1"
     ;;
   --process-all)
     ensure_dirs
     load_baseline
+    check_snapshot_dir
     for id in $(list_pending_requests); do
       process_request "$id" || true
     done

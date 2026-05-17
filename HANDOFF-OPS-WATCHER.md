@@ -229,3 +229,107 @@ watcher 自身不接触 docker（Step A），最坏后果只是写错误的 resu
 ---
 
 完。
+
+
+
+---
+
+## Checkpoint：B.0 + B.1 完成（2026-05-17）
+
+> 追加日志，不改前文。前文"Step B 必做"列表保留了当时的决策快照。
+
+### B.0 — 仓库卫生（commit `ffc3e1f`）
+
+发现 main 分支上三个服务的 build context / Dockerfile 与生产机现实不一致：
+- 根 `Dockerfile` 是 notifier 内容（python），但 compose 让 agent build 它
+- `notifier/` 与 `collector/` 子目录在 git 上根本不存在
+- `proxy/`、`config/`、`scripts/search-helper.py` 等路径 compose / Dockerfile
+  期望子目录但实际散在根目录
+
+→ 一次干净的目录整理：
+```
+Dockerfile               agent (node:20-slim + claude-code), banner 自报
+notifier/Dockerfile      notifier (python + telegram), banner 自报
+notifier/notifier.py
+collector/Dockerfile     collector (python + audit), banner 自报
+collector/collector.py
+proxy/{squid.conf,allowed_domains.txt}
+config/litellm_config.yaml
+scripts/search-helper.py
+```
+
+每个 Dockerfile 头部带 banner 注释列出"我是哪个 + 不要和哪个搞混"，
+解决"三个服务都叫 Dockerfile，agent grep 容易选错"的歧义问题。
+
+生产实测：`docker compose build agent / notifier / collector` 三者皆通过。
+
+### B.1 — snapshot 物理迁移 + agent 接入
+
+#### 架构决策（Plan B）
+
+snapshot 的"所有权"属于 watcher，不属于 agent。把它塞进 agent_workspace/
+让两种生命周期不同的东西（watcher 产物 vs agent 工作产物）共用同一目录树，
+并污染 agent_workspace 的独立 git repo 状态。修正：
+
+- 宿主机：`~/ai_sandbox/snapshot/` (watcher 产物，独立)
+- agent_workspace 仍然是 agent 唯一可写 :rw 挂载源
+- 容器内挂载点不变（`/app/workspace/.snapshot`），agent 心智模型未受影响
+- compose 形态：`./snapshot:/app/workspace/.snapshot:ro` 嵌套在 :rw workspace 内
+
+不升级到 B'（`/app/snapshot` 容器内独立路径）的理由：
+`.snapshot/current/...` 心智模型已深度嵌入 helper / watcher / 文档，B 在
+macOS Docker Desktop overlayfs + iptables backend 上**实测**嵌套 :ro 成立。
+未来 Docker Desktop 升级若改变此行为，回退到 B' 是单一变量切换。
+
+#### 迁移协议（Plan C — 保留身份迁移）
+
+不选"清空 pending 后 init 新位置"（A），不选"直接 init 让旧 proposal stale"（B），
+选 C：**先把现有 snapshot 原样 mv 到新位置**（保留 versions/ + current symlink +
+.snapshot-id + .snapshot-hash），mv 之后用三铆钉对账校验"身份没变"，挂载
+ro 触摸测试通过，smoke test 用旧 snapshot id 跑一次 proposal 通过，最后才
+决定是否 refresh。
+
+把"目录搬家"和"事实版本前进"拆开成两个独立动作，事后审计可还原。
+完整步骤：`scripts/ops/MIGRATION-SOP.md`。
+
+#### 落地清单
+
+| 文件 | 改动 |
+|------|------|
+| `init-snapshot.sh` | `SNAPSHOT_DIR="${OPS_SNAPSHOT_DIR:-$PROJECT_DIR/snapshot}"` |
+| `ops-watcher.sh` | 同上 + 新函数 `check_snapshot_dir`（启动自检 fatal exit），main_loop / --once / --process-all 三处入口都调 |
+| `ops-helper.sh` | `SNAPSHOT="${OPS_SNAPSHOT:-$WORKSPACE/.snapshot}"`（容器内默认行为不变） |
+| `docker-compose.yml` | agent.volumes 加 `./snapshot:/app/workspace/.snapshot:ro` |
+| `ops-baseline.json` | `agent_volumes_required` 加新挂载（baseline 与 compose 同步生效，互相对账） |
+| `Dockerfile`（agent） | `COPY scripts/ops/ops-helper.sh /usr/local/bin/ops-propose` + chmod |
+| `OPS-WATCHER-DESIGN.md` | 目录结构图 + 挂载形态注释（标记"实测成立"） |
+| `MIGRATION-SOP.md` | 新文件，Plan C 完整步骤 |
+
+helper escape hatch (`OPS_SNAPSHOT` / `OPS_SNAPSHOT_DIR`) 让宿主机
+迁移期/调试期不需要撬脚本骨头：
+```bash
+# 宿主机调试时指向旧位置（迁移前）
+OPS_SNAPSHOT=~/ai_sandbox/agent_workspace/.snapshot bash scripts/ops/ops-helper.sh ...
+# 或指向新位置
+OPS_SNAPSHOT_DIR=~/ai_sandbox/snapshot bash scripts/ops/ops-watcher.sh --once <id>
+```
+
+容器内默认（不设环境变量）行为完全不变。
+
+### 已知遗留：DOCKER_INSECURE_NO_IPTABLES_RAW
+
+用户生产机 `docker info` 显示 `WARNING: DOCKER_INSECURE_NO_IPTABLES_RAW is set`。
+这是 Docker Desktop 实验态防火墙模式，会让 raw iptables 表绕过容器隔离的
+部分检查。**和 ops-watcher 当前范围无关**，但下游某天处理网络隔离假设
+（apply-proposal? Phase 4？）时需要重新评估。先记账，不在 B.x 处理。
+
+### 还没做（B.2-B.4）
+
+- B.2 Telegram 单向摘要通知（独立 .ops-watcher.env，权限不对则降级不崩）
+  - 单向：只 sendMessage，永远不 getUpdates / 不开 webhook
+  - 摘要：id / status / risk / 路径列表 / +N/-M 行
+  - 有限 hunk：每 change 最多 5 行 unified diff，整体 ≤4KB
+  - 频控：同 proposal_id 60s 内只发一次
+  - 失败不阻断：Telegram POST 失败只写 events.jsonl ERROR
+- B.3 集成测试 SOP（agent 容器内真实跑 ops-propose 全链路）
+- B.4 launchd plist 开机自启（最后做）

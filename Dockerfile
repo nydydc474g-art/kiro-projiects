@@ -92,6 +92,12 @@ ENV PATH="$VENV_PATH/bin:$PATH"
 COPY scripts/search-helper.py /usr/local/bin/search-helper
 RUN chmod 0755 /usr/local/bin/search-helper
 
+# 9.1 安装 ops proposal helper（agent 唯一的 ops 提案入口）
+# B.1 (2026-05-17): 给 agent 容器内一个不可绕过、可审计的 proposal 提交命令
+# 来源 ops-helper.sh 在仓库 scripts/ops/ 下；watcher 不信任 helper 仍会重验所有字段
+COPY scripts/ops/ops-helper.sh /usr/local/bin/ops-propose
+RUN chmod 0755 /usr/local/bin/ops-propose
+
 # 10. 工作目录
 WORKDIR /app
 

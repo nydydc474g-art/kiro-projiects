@@ -96,23 +96,47 @@ agent (容器内)              watcher (宿主机常驻)             你 (手机
 
 ### 目录结构
 
+> 物理布局 (B.1, 2026-05-17): `snapshot/` 已迁出 `agent_workspace/`，作为
+> watcher 产物独立挂在项目根。容器内挂载点不变（仍为
+> `/app/workspace/.snapshot`），所以 agent 心智模型未受影响。详见
+> `scripts/ops/MIGRATION-SOP.md`。
+
 ```
-agent_workspace/
-├── .snapshot/                       # watcher 维护的只读快照
-│   ├── .snapshot-id                 # 当前快照 ID（YYYYMMDDTHHMMSSZ）
-│   ├── docker-compose.yml
-│   ├── Dockerfile
-│   ├── proxy/
-│   ├── collector/
-│   └── notifier/
-├── ops-proposals/<id>/
-│   ├── manifest.json
-│   └── <候选文件，路径与生产对应>
-├── ops-requests/
-│   └── <id>.json                    # agent 触发审批
-└── ops-results/
-    └── <id>.json                    # watcher 写回结果，agent 可读
+~/ai_sandbox/                        # 项目根（宿主机）
+├── snapshot/                        # ← B.1 起的新位置（watcher 产物）
+│   ├── versions/<snapshot-id>/      # 每次 refresh 一个版本目录
+│   ├── current -> versions/<id>     # 相对 symlink
+│   ├── .snapshot-id                 # 顶层指针
+│   └── .snapshot-hash
+│
+└── agent_workspace/                 # agent 可写工作区（独立 git repo）
+    ├── ops-proposals/<id>/
+    │   ├── manifest.json
+    │   └── <候选文件，路径与生产对应>
+    ├── ops-requests/
+    │   └── <id>.json                # agent 触发审批
+    └── ops-results/
+        └── <id>.json                # watcher 写回结果，agent 可读
+
+# 容器内（agent 视角，不变）
+/app/workspace/                      # = ./agent_workspace (rw)
+└── .snapshot/                       # = ./snapshot (ro), 嵌套 :ro 挂载
+    └── current/...                  # agent 通过此路径看当前生产事实
 ```
+
+挂载形态（实测成立, macOS Docker Desktop overlayfs + iptables firewall backend）:
+
+```yaml
+volumes:
+  - ./agent_workspace:/app/workspace:rw
+  - ./snapshot:/app/workspace/.snapshot:ro   # 嵌套 :ro 在 :rw 子路径上
+```
+
+容器内 `/app/workspace/.snapshot` 在 macOS Docker Desktop 上经实测确为只读
+（B.1 验证：`touch /app/workspace/.snapshot/x` 返回 Read-only file system）。
+未来 Docker Desktop 升级若改变此行为，回退方案：把容器内挂载点也独立到
+`/app/snapshot`，同步 helper `SNAPSHOT` 默认值。
+
 
 ### manifest.json 格式
 

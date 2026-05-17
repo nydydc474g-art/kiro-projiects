@@ -1,10 +1,15 @@
 #!/bin/bash
 # init-snapshot.sh
-# 初始化或刷新 .snapshot/ — agent 只读快照
+# 初始化或刷新 snapshot/ — agent 只读视野
 # 用途：watcher 启动时调用；apply 成功后调用以更新快照
 #
+# 物理位置 (B.1, 2026-05-17):
+#   宿主机:   ~/ai_sandbox/snapshot/                  (watcher 产物，独立于 agent_workspace)
+#   容器内:   /app/workspace/.snapshot/               (agent 心智模型不变)
+#   compose:  ./snapshot:/app/workspace/.snapshot:ro  (独立 :ro 挂载，嵌套在 :rw workspace 之内)
+#
 # Phase 1.2 设计：
-#   .snapshot/                     ← 稳定挂载点（compose bind mount 不变）
+#   snapshot/                      ← 稳定挂载源（compose bind mount 不变）
 #     versions/
 #       <snapshot-id>/             ← 每次 refresh 创建新版本目录
 #         .snapshot-id
@@ -27,7 +32,10 @@ set -eo pipefail
 
 PROJECT_DIR="${PROJECT_DIR:-$HOME/ai_sandbox}"
 WORKSPACE_DIR="$PROJECT_DIR/agent_workspace"
-SNAPSHOT_DIR="$WORKSPACE_DIR/.snapshot"
+# B.1: snapshot 物理位置从 agent_workspace/.snapshot/ 迁到 project root snapshot/
+# 容器内挂载点不变（仍为 /app/workspace/.snapshot），见 docker-compose.yml agent.volumes
+# OPS_SNAPSHOT_DIR 用于宿主机迁移期/调试时显式覆盖（如指向旧 agent_workspace/.snapshot）
+SNAPSHOT_DIR="${OPS_SNAPSHOT_DIR:-$PROJECT_DIR/snapshot}"
 VERSIONS_DIR="$SNAPSHOT_DIR/versions"
 
 # SNAPSHOT_INCLUDED：agent 通过 .snapshot/current 可读的"生产现状"
