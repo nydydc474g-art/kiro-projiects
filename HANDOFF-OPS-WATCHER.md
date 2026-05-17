@@ -405,3 +405,62 @@ proposal，仍会撞老的。
    B.1 实测中通过 Phase 4.6 增补步骤修正。
 2. zsh 默认不识别 `# 注释`，命令块顶部用 `# ===` 装饰行会让 zsh 把分隔字符
    当命令名报 not found。SOP 应避免此风格，或显式 `setopt interactive_comments`。
+
+
+---
+
+## Checkpoint：B.1 hotfix v2 完成（2026-05-17）
+
+### 抽象层补全
+
+`<id>.json.status` 是 proposal 的**初始裁决**，但 proposal 实际状态会通过 sibling 文件演进。任何 watcher 决策（conflict 占位、supersedes target 是否合法、未来 apply 队列）都必须读"当前生命周期投影"，而不是初始裁决。
+
+`get_effective_status(id)` 是这个投影的单一真相来源：
+
+```
+""                       proposal 不存在
+pending                  目录在但还没出 result
+accepted_for_review      仍占位（可被 supersede / 与其他 proposal 冲突）
+superseded               sibling 投影（一期）；Phase 4 加 applied / rolled_back
+blocked / rejected /
+preflight_failed /
+stale / conflict /
+disabled                 已闭合（不占位）
+```
+
+### 生产实测三组验证
+
+| 测试 | 输入 | 期望 reason | 实际 reason | OK |
+|---|---|---|---|---|
+| A | supersede conflict-state target (085137) | 必须 accepted_for_review | effective_status='conflict' (must be accepted_for_review) | yes |
+| B | supersede already-superseded target (065617) | 必须 accepted_for_review | effective_status='superseded' (must be accepted_for_review) | yes |
+| C | 不带 supersedes 改占位 path (084006 在占位) | 报 path conflict | path conflict with pending proposal '20260517-084006-28b44c' | yes |
+
+### 现场 effective_status 总览（hotfix v2 视角）
+
+```
+20260517-065617-2e08a7   superseded            (最早占位，已被 084006 supersede)
+20260517-071105-bb0219   blocked               (Step A.1 baseline 测试遗留)
+20260517-083443-1e08bc   conflict
+20260517-084006-28b44c   accepted_for_review   <- 当前唯一占位
+20260517-085137-2227da   conflict
+20260517-085656-c8d445   conflict
+20260517-090438-511312   conflict   (TEST A)
+20260517-090449-841981   conflict   (TEST B)
+20260517-090510-69721c   conflict   (TEST C)
+```
+
+watcher 视野与现实完全一致。
+
+### 设计意义
+
+抽象层补对，下游不用再补丁：
+- Phase 4 加 `<id>.applied.json` / `<id>.rolled_back.json` 时，`get_effective_status` 加 2 行 case 即可
+- conflict / 未来 apply 队列 / 任何 lifecycle 判定都不需要再改一行
+- "幽灵换个名字回来"在抽象层闭合，不会再以新形式涌现
+
+### 还没做（B.2-B.4，不变）
+
+- B.2 Telegram 单向摘要通知
+- B.3 集成测试 SOP
+- B.4 launchd plist 开机自启
