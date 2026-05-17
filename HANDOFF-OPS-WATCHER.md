@@ -505,3 +505,70 @@ apply-proposal.sh 必须在 apply 前重读 `get_effective_status`，拒绝非 a
 
 - B.3 集成测试 SOP（agent 容器内真实跑 ops-propose 全链路 + Telegram 实测）
 - B.4 launchd plist 开机自启
+
+
+
+---
+
+## Checkpoint：B.2 hotfix（2026-05-17）
+
+### 触发原因
+
+B.2 沙箱完成、生产首次实测：手机收不到 started，events.jsonl 全是 `error
+"telegram send failed"`。诊断闭环（用户自己钉死的）：SR (Shadowrocket-on-Mac)
+监听端口从 1086 飘到 1082，`.ops-watcher.env` 用的是过期端口。
+
+### 已交付（沙箱完成；待生产实测）
+
+| 文件 | 改动 |
+|---|---|
+| `scripts/ops/ops-watcher.sh` | 4 处：`TELEGRAM_PROXY_URL` 专用变量替代全局 HTTPS_PROXY；`load_telegram_env` 主动 unset 全局代理变量；`LAST_TELEGRAM_HTTP_CODE` 暴露 curl http_code 给 events.jsonl 诊断；`check_heartbeat` + 主循环 hook |
+| `scripts/ops/.ops-watcher.env.example` | 加 `TELEGRAM_PROXY_URL` 注释 + 现实约束声明 |
+| `OPS-WATCHER-DESIGN.md` | 追加 B.2 hotfix checkpoint：4 处改动 + 设计意图 + bash 3.2 兼容陷阱 + 不变量保持 |
+
+### 关键设计决策（不破坏不变量）
+
+1. **代理作用域局部化**：`TELEGRAM_PROXY_URL` 只对 sendMessage 一处生效，
+   不再用 `HTTPS_PROXY`（全局开关 = 污染面太大）
+2. **诊断可见性**：events.jsonl 出现 `telegram send failed` 时附带 http_code
+   字段（000=连接失败 / 401=token错 / 400=chat_id错 / 429=rate limit）
+3. **heartbeat 端到端心跳**：每 6h 发 `📊 watcher heartbeat snapshot=... queue=...
+   last=...`，是"watcher + 代理 + telegram"三件事都活着的端到端证明
+4. **失败推进时间戳**：heartbeat 失败也写 `.last-heartbeat`，避免代理离线时
+   polling 模式 2s 一次刷 error 洪流（缺失的 heartbeat 本身就是出问题信号）
+
+### 现实约束（写进文档）
+
+> 依赖本地代理时，若 watcher 由 launchd 自启而代理客户端（SR/ClashX/Surge）
+> 尚未就绪，started 通知可能发不出。watcher 主流程不受影响（write_event ERROR
+> 兜底），但用户在手机上观察不到 started。**这是依赖本地代理出口的天然代价，
+> 不是 watcher bug**。修复方案：B.4 launchd plist 加启动顺序约束 + heartbeat
+> 心跳作为侧面信号（heartbeat 间隔内代理上线后第一个 tick 就有信号）。
+
+### 用户操作（生产机最小动作）
+
+```bash
+SANDBOX=/Users/caimin/ai_sandbox
+BASE=https://raw.githubusercontent.com/nydydc474g-art/kiro-projiects/ops-watcher-step-b-hotfix
+
+curl -fsSL "$BASE/scripts/ops/ops-watcher.sh" -o "$SANDBOX/scripts/ops/ops-watcher.sh"
+curl -fsSL "$BASE/scripts/ops/.ops-watcher.env.example" -o "$SANDBOX/scripts/ops/.ops-watcher.env.example"
+chmod +x "$SANDBOX/scripts/ops/ops-watcher.sh"
+
+# 改 .ops-watcher.env：把 HTTPS_PROXY=http://127.0.0.1:XXXX 改为 TELEGRAM_PROXY_URL=
+sed -i '' 's|^HTTPS_PROXY=|TELEGRAM_PROXY_URL=|' "$SANDBOX/.ops-watcher.env"
+chmod 600 "$SANDBOX/.ops-watcher.env"
+cat "$SANDBOX/.ops-watcher.env"   # 确认是 TELEGRAM_PROXY_URL=...
+
+# Ctrl-C 现在跑着的旧 watcher，重启
+bash "$SANDBOX/scripts/ops/ops-watcher.sh"
+```
+
+期望：手机收到 started + events.jsonl 出现 `info "telegram sent"` 且
+`http_code: "200"`。
+
+### B.3 / B.4 待办（不变）
+
+- B.3 完整生产 SOP：lifecycle 4 档 + proposal 4 档 + heartbeat（间隔可临时设
+  60s 加速测试）一次性测完
+- B.4 launchd plist 开机自启，加 SR 启动顺序约束 + heartbeat 作为侧面信号
