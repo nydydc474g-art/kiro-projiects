@@ -90,7 +90,7 @@ fi
 # T1.5: 不能挂载新文件系统
 echo "  T1.5: 不能 mount..."
 MOUNT_RESULT=$(docker exec agent mount -t tmpfs none /tmp/test 2>&1 || true)
-if echo "$MOUNT_RESULT" | grep -qiE "permission denied|operation not permitted"; then
+if echo "$MOUNT_RESULT" | grep -qiE "permission denied|operation not permitted|must be superuser"; then
   pass "mount 被拒绝（cap_drop ALL 生效）"
 else
   fail "mount 未被拒绝: $MOUNT_RESULT"
@@ -366,23 +366,27 @@ header "T5: 资源耗尽防护"
 
 # T5.1: PID 限制
 echo "  T5.1: PID 限制 (pids_limit: 256)..."
-PID_RESULT="$(docker exec agent bash -c '
-pids=()
+PID_OUTPUT="$(docker exec agent bash -c '
+count=0
 for i in $(seq 1 300); do
   sleep 999 &>/dev/null &
-  pids+=($!)
   if [ $? -ne 0 ]; then break; fi
+  count=$((count+1))
 done
-echo "${#pids[@]}"
-kill "${pids[@]}" 2>/dev/null
+echo "$count"
+kill $(jobs -p) 2>/dev/null
 wait 2>/dev/null
-' 2>&1 | tail -1 || true)"
+' 2>&1 || true)"
+# 提取最后一行纯数字，忽略 stderr 噪声
+PID_RESULT="$(echo "$PID_OUTPUT" | grep -E '^[0-9]+$' | tail -1 || true)"
 PID_RESULT="${PID_RESULT:-0}"
-# 256 PID 总量减去已有进程，能 fork 的应该 < 250
-if [ "${PID_RESULT:-0}" -lt 280 ]; then
-  pass "PID 限制生效（fork 成功数: ${PID_RESULT:-unknown}）"
+# 如果输出包含 "Resource temporarily unavailable" 说明限制已生效
+if echo "$PID_OUTPUT" | grep -qi "Resource temporarily unavailable\|Cannot fork"; then
+  pass "PID 限制生效（fork 触发资源限制）"
+elif [ "$PID_RESULT" -lt 280 ] 2>/dev/null; then
+  pass "PID 限制生效（fork 成功数: $PID_RESULT）"
 else
-  fail "PID 限制可能失效（fork 了 ${PID_RESULT} 个）"
+  fail "PID 限制可能失效（输出: $PID_OUTPUT）"
 fi
 
 # T5.2: /tmp tmpfs 容量限制 (512M)
