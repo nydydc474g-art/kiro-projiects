@@ -760,3 +760,87 @@ bash scripts/ops/ops-watcher.sh &
 - 集成测试：agent 容器内真实 submit → watcher 实际处理 → Telegram 收到通知
 
 Step B 仍只做"静态检查"，不真实 docker compose up（那是 Phase 4 apply-proposal.sh 的事）。
+
+
+
+---
+
+## Checkpoint：Step A + A.1 完成（2026-05-17）
+
+### 已交付
+
+| 文件 | 行数 | 角色 |
+|------|------|------|
+| `scripts/ops/init-snapshot.sh` | ~190 | versions/current 结构 + 7 步定序 + 双向校验 |
+| `scripts/ops/ops-helper.sh` | ~440 | agent 容器内 ops-propose（new/add/set-*/validate/submit） |
+| `scripts/ops/ops-baseline.json` | 61 | watcher 唯一安全合同 |
+| `scripts/ops/ops-watcher.sh` | ~960 | 14 个检查模块 + 主循环 + 状态机 |
+| `scripts/ops/README.md` | ~200 | 状态流图 + 命名规则 + 验证步骤 |
+
+### Step A 状态流（顺序固定）
+
+```
+disabled → manifest schema → BLOCK paths → candidate files →
+stale → conflict (with supersedes) → global rules →
+baseline invariants → manifest whitelists → preflight →
+classify → accepted_for_review
+```
+
+### Step A.1 修复的 3 个缺口
+
+1. **baseline 没被 watcher 使用** → 实装 `check_baseline_invariants`，`docker compose config --format json` 比对 agent 安全字段 + 必需挂载，docker 缺失保守拒绝
+2. **watcher 信任 manifest 没重验候选文件** → 实装 `check_candidate_files`，重跑 exists/symlink/regular/sha256/no-op 检查
+3. **`check_manifest_whitelists` 废线** → 删除
+
+### 测试覆盖
+
+16 类自动化场景全过：
+```
+T1  合法 LOW                    → accepted_for_review LOW
+T2  claude_config 路径          → blocked BLOCK
+T3  compose privileged          → blocked BLOCK
+T4  compose ports               → blocked BLOCK
+T5  stale                       → stale
+T6  conflict                    → conflict
+T7  watcher disabled            → disabled
+T8  hadolint missing            → accepted MEDIUM (skipped_missing_tool)
+T10 malformed JSON              → rejected
+T11 supersedes 合法替代          → 新 accepted, 旧 superseded sibling
+T12 删 read_only (A.1-1)        → blocked BLOCK
+T13 删 cap_drop ALL (A.1-1)     → blocked BLOCK
+T14 删 audit_spool:ro (A.1-1)   → blocked BLOCK
+T15 candidate 缺失 (A.1-2)      → rejected
+T16 sha256 漂移 (A.1-2)         → rejected
+T17 symlink (A.1-2)             → rejected
+T18 candidate 是目录 (A.1-2)    → rejected
+```
+
+### 生产宿主机实测确认
+
+```
+[2026-05-17T06:55:29Z] snapshot refreshed
+  id: 20260517T065529Z
+  hash: 570f163bdfca5a9792339c3549e9fe83c92952a849f9b80eca0d4b655003307b
+
+helper → submit → watcher 全链路：
+  Submitted: 20260517-065617-2e08a7
+  20260517-065617-2e08a7 | accepted_for_review | LOW | proxy/allowed_domains.txt (+1/-0 lines) | passed all static checks
+
+baseline invariant 真比对（A.1-1 验证）：
+  20260517-071105-bb0219 | blocked | BLOCK | docker-compose.yml (+3/-3 lines) | agent.read_only=false, baseline requires true
+```
+
+### Step B（下窗口启动）
+
+详见 `HANDOFF-OPS-WATCHER.md`。范围：
+
+- compose 挂载 `.snapshot:ro`
+- Dockerfile COPY ops-helper.sh → `/usr/local/bin/ops-propose`
+- Telegram 通知（4 档 + 启停）
+- launchd plist 开机自启
+- agent 容器内集成测试
+
+不做（留给后续）：
+- apply-proposal.sh（Phase 4）
+- verifications/ 命名检查项库（Phase 5）
+- 真实 docker compose up（Phase 4）
