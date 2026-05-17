@@ -570,3 +570,122 @@ rm ~/ai_sandbox/.ops-watcher.disabled
 - watcher 仍保留 BLOCK 检测（后端不信任前端，纵深冗余）
 
 下一步：Phase 1.1 完成后进入 Phase 2（compose 挂载 + watcher 主循环 + 风险分级）。
+
+
+
+---
+
+## Checkpoint：Phase 1.1 完成 + Phase 1.2 待办（2026-05-17）
+
+Phase 1.1 在生产宿主机（macOS）实测通过，22 项硬化全部到位，16 项自动化测试 + 4 项手动负向测试全过。
+
+### 在 review 中发现的待修问题（Phase 1.2）
+
+#### 实质性 bug
+
+1. **`random_suffix()` SIGPIPE bug**
+   实测产出 ID `20260517-062236-gwhxxx`，三位真随机后缀加上了固定的 `xxx`。
+   原因：`tr ... < /dev/urandom | head -c 3` 在 `set -o pipefail` 下，head 读够 3 字符后 tr 收到 SIGPIPE，整条 pipeline 视为失败 → `|| echo "xxx"` 触发追加。
+   修复：改用 `LC_ALL=C od -An -N3 -tx1 /dev/urandom | tr -d ' \n'`，od 一次性读 3 字节后正常退出，无 SIGPIPE。
+
+2. **bind mount 与目录 mv 替换的 inode 冲突**
+   当前 `init-snapshot.sh` 用 `mv old → backup; mv staging → snapshot` 替换。
+   宿主机视角是原子的，但 bind mount 绑定的是原目录 inode 而非路径名。
+   Phase 2 计划把 `.snapshot:/app/workspace/.snapshot:ro` 挂给 agent 后，宿主机替换目录会让 agent 容器仍指向旧 inode，宿主机以为刷新了，agent 还在读旧 snapshot——直接伤害 base_snapshot_id 的可信度。
+   修复：改为 `versions/<id>/ + current symlink` 结构，refresh 时只原子切换 current symlink。bind mount 稳定挂 `.snapshot/` 根目录不动。
+
+#### 结构性收紧
+
+3. **`add` 不拒绝 symlink**
+   当前只检查 `[ -f ]` 会跟随 symlink。proposal 里如果放了 `proxy/allowed_domains.txt -> /etc/passwd`，helper 仍会算 hash 写 manifest。
+   修复：
+   - `[ -L ]` 直接拒绝
+   - `realpath` 必须仍在 proposal 目录内
+
+4. **manifest 缺 `base_snapshot_hash`**
+   snapshot 已有 id + hash，但 manifest 只写了 id。Phase 2 watcher apply 前应该双重校验：id 防版本错位，hash 防内容漂移。
+
+#### 设计收紧
+
+5. **PROPOSAL_PATH_ALLOWED 偏宽**
+   当前 `collector/[^/]+\.(py|txt|conf)` 允许 agent 提案新增任意文件名。
+   一期收窄到具体文件白名单（collector.py / Dockerfile / squid.conf 等枚举）。
+   "新增代码文件"是与"修改既有文件"不同的风险层级，留作 Phase 2 风险分级的扩展点（自动升 MEDIUM/HIGH）。
+
+6. **`verification` 非空校验缺失**
+   manifest 字段已设计但 validate 未要求非空。watcher 后面要靠它生成验证计划。
+   修复：submit 校验加上 `verification | length > 0`，且每个 name 后续在 watcher 白名单内。
+
+7. **空 proposal 不该 submit**
+   当前 add 时若候选文件与 snapshot 完全一致，会标 `no changes vs snapshot` 但仍进 .changes。
+   修复：helper add 仍允许（提示 WARN 给 agent 迭代用），submit 时若全部 changes 都是 no-op，拒绝。
+
+#### 文档
+
+8. README 负向测试示例不严谨（`new` 生成新 ID，但示例引用 `test-block`，没串起来）。修。
+
+### Phase 1.2 设计：versions/current 结构
+
+```
+.snapshot/                          ← 稳定挂载点（compose bind mount）
+  versions/
+    <snapshot-id-1>/
+      .snapshot-id
+      .snapshot-hash
+      docker-compose.yml
+      Dockerfile
+      proxy/
+      ...
+    <snapshot-id-2>/
+      ...
+  current -> versions/<latest-id>   ← 相对 symlink（整目录搬走仍自洽）
+  .snapshot-id                      ← 顶层指针，等价于 cat current/.snapshot-id
+  .snapshot-hash                    ← 顶层指针，等价于 cat current/.snapshot-hash
+```
+
+agent 读 `.snapshot/current/...` 或顶层 `.snapshot/.snapshot-id`。
+watcher 双向校验：顶层值 == versions/current 内值，不一致 → WARN（识别外部篡改）。
+
+### Refresh 7 步定序
+
+```bash
+# 1. 构建 versions/<new-id>.staging/
+# 2. 写入 .snapshot-id / .snapshot-hash 到 staging 内
+# 3. mv versions/<new-id>.staging → versions/<new-id>     (原子)
+# 4. ln -sfn "versions/<new-id>" current.new              (相对路径)
+# 5. mv current.new current                                (原子切换)
+# 6. 顶层 metadata 原子写：
+#    - 写 .snapshot-id.new + mv → .snapshot-id
+#    - 写 .snapshot-hash.new + mv → .snapshot-hash
+# 7. 双向校验（顶层 == versions/current 内），不一致输出 WARN（不回滚，让下次校验抓住）
+```
+
+第 6 步失败可被双向校验检测到 = 设计意图（不静默掩盖）。
+
+### versions/ 保留策略
+
+- Phase 1.2：不自动 prune（顺其自然，避免 bug）
+- Phase 2+：watcher 根据保留窗口清理（默认保留最近 N 个）
+
+### 测试覆盖（Phase 1.2 结束后跑）
+
+原 16 项 + 新增 4 项负向：
+
+| # | 测试 |
+|---|------|
+| N1 | symlink proposal 被拒（add 阶段） |
+| N2 | 顶层 .snapshot-id 与 versions/current/.snapshot-id 不一致被检测 |
+| N3 | verification=[] 时 submit 被拒 |
+| N4 | 全部 change 都是 no-op 时 submit 被拒 |
+
+`base_snapshot_hash` 正向写入并入原有正向测试。
+
+### 实施顺序
+
+1. `init-snapshot.sh`：versions/current 结构 + 7 步定序 + 双向校验输出
+2. `ops-helper.sh`：random_suffix / symlink 防御 / base_snapshot_hash / 收窄白名单 / verification 必填 / 空变更拒绝
+3. `README.md`：结构图 + 保留策略 + 修负向测试示例
+4. 测试套件扩展（16 + 4 负向 + base_snapshot_hash 正向）
+5. 一次提交推送
+
+完成 Phase 1.2 后才进入 Phase 2（compose 挂载 + watcher 主循环 + 风险分级）。
