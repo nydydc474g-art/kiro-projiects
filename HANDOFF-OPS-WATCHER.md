@@ -1333,3 +1333,181 @@ matrix 的最后一格，也是 B.3 集成测试的收尾——闭合 5/5。
 - `ops-requests/.processed/<id>.json` 留着
 - `ops-proposals/<id>/` 留着（已归档到 `ops_spool/proposals/<id>/`）
 - 不需要清理任何东西
+
+
+
+---
+
+## Checkpoint：B.3 path BLOCK 验收 + Authoritative Result Invariant 修复（2026-05-17 晚）
+
+> **本段是 B.3 的正式闭合记录。** 通知矩阵 4/4 + lifecycle 4/4 + 一个意外发现的 split-brain bug 修复。
+
+### 时间线
+
+| 时间(UTC+8) | 事件 |
+|-------------|------|
+| ~21:10 | 第一次 path BLOCK 测试（`20260517-131105-e0c420`）：events + telegram 说 blocked×BLOCK，但 result file 是 **0 字节** |
+| ~21:15 | 根因定位：`${5:-{\}}` 在 bash 展开为 `{\}` 不是 `{}`，jq --argjson 失败，`process_request || true` 吞错误，空 tmp 被 mv 成权威 result |
+| ~21:30 | 修复 commit `8644b8e`（agent 版）push 到 `ops-watcher-step-b-hotfix-auth-result-invariant` 分支 |
+| ~21:40 | 用户在生产端实施修复（git pull → Ctrl-C 旧 watcher → 启新 watcher） |
+| ~21:45 | 手机收到 `ℹ️ ops-watcher stopped (graceful shutdown)` —— lifecycle stopped 顺手实证 |
+| ~22:06 | 第二次 path BLOCK 测试（`20260517-140640-3943c0`）：result 1161 字节、jq empty=0、status=blocked/BLOCK ✅ |
+| ~22:07 | 手机收到 🚨 BLOCKED 通知（正确文案） |
+| ~22:20 | 用户上传精简版 ops-watcher.sh（去掉冗长注释块，保留等价行为 + 两处更严校验） |
+| ~22:50 | agent review 通过 → mv 到正确路径 → push `393934b` |
+
+### B.3 通知矩阵闭合（4/4）
+
+| risk | proposal id | status | result 验证 |
+|------|------------|--------|-------------|
+| LOW | 20260517-122027-ea3b87 | accepted_for_review | ✅ |
+| MEDIUM | 20260517-122337-7f1f91 | accepted_for_review | ✅ |
+| HIGH | 20260517-123059-9048d1 | accepted_for_review | ✅ |
+| BLOCK | 20260517-140640-3943c0 | blocked | ✅ 1161B valid JSON |
+
+bug 证据保留：`20260517-131105-e0c420.json` = 0 字节（不删，审计用途）。
+
+### B.3 lifecycle 闭合（4/4）
+
+| 事件 | 时间 | 手机通知 | events.jsonl |
+|------|------|---------|--------------|
+| started | 多次 | ✅ | ✅ |
+| disabled | B.3 早期 | ✅ | ✅ |
+| resumed | B.3 早期 | ✅ | ✅ |
+| stopped | 本次 Ctrl-C | ✅ `ℹ️ ops-watcher stopped (graceful shutdown)` | ✅ |
+
+### Bug：Authoritative Result Invariant 撕裂态
+
+**根因**：
+
+```bash
+# 三处同款 bug（write_event / write_result / finalize_proposal）
+local details_json="${5:-{\}}"
+```
+
+bash 参数展开里 `\}` 是**字面字符**，不是转义——`${5:-{\}}` 在 $5 未传时展开为三字符 `{\}`。`jq --argjson details "{\}"` 报 "invalid JSON"，jq 进程退 1 但不写 stdout → tmp 文件 0 字节 → `mv "$tmp" "$result_file"` 把空文件发布为权威 result → 然后 `notify_proposal` 用函数入参（不读 result file）照常发 telegram → split-brain。
+
+`process_request "$id" || true` 在主循环里吞掉了整个链路的非零退出，让 watcher 继续而不是崩溃——这是**正确的容错**（不能因为一个 proposal 炸了让整个 watcher 死），但跟上面的 bug 叠加后制造了"事件和手机说 blocked，但权威 result 是空"的撕裂态。
+
+**修复（同一个 commit，三个站点）**：
+
+1. `write_event`：`${4:-}` + `[ -z "$extra_json" ] && extra_json='{}'`
+2. `write_result`：同上 + jq 失败返回 1 + `[ ! -s "$tmp" ] || ! jq -e . "$tmp"` 校验 + 失败时显式 `rm -f "$tmp"` 不 mv
+3. `finalize_proposal`：同上 + `if ! write_result ...; then return 1; fi` — 失败时**不 consume、不 archive、不 notify**
+
+**守序契约（最终版，代码内两条短注释 + 本段作 anchor）**：
+
+> No notification may be emitted unless the authoritative result JSON has first been durably published and validated.
+>
+> finalize_proposal() 效果顺序不可协商：
+> 1. write_result（produce + validate + atomic mv）
+> 2. consume_request
+> 3. archive_proposal
+> 4. notify_proposal
+
+**验证覆盖**：
+
+| 测试 | 场景 | 结果 |
+|------|------|------|
+| 沙箱 T1 | 合法 details_json | publish 成功 |
+| 沙箱 T2 | 非法 details_json 'NOT-A-JSON-OBJECT' | 拒绝发布，rc=1，error event |
+| 沙箱 T3 | 省略 $5/$6（旧 bug 复现路径） | `{}` 正确替代，result 里 details=={} |
+| 沙箱 T4 | finalize_proposal + write_result 失败 | 不 consume、不 archive、不 notify |
+| 沙箱 T5 | finalize_proposal 正常路径 | consume + archive + publish 全发生 |
+| 生产 | 20260517-140640-3943c0 path BLOCK | 1161B valid JSON，telegram 200 |
+
+### 发现但今天不修：supersede 语义漏洞
+
+**现象**（今晚 baseline invariant BLOCK SOP 设计推演时发现）：
+
+如果新 proposal 带 `supersedes: <old_id>` 且 old 的 docker-compose.yml 仍占位，当前代码在 `check_conflict` 阶段就**立即写 `.superseded.json` sibling** 释放旧 proposal——此时新 proposal 自身闸门（global_rules / baseline_invariants / whitelists / preflight）**还没跑完**。如果新 proposal 后续被 BLOCK，旧的已被释放：一个非法 proposal 凭空顶掉了合法 proposal。
+
+**contract（Phase 4 前置决议，今天不动代码）**：
+
+> supersedes 的声明合法性（target 存在 + target 是 accepted_for_review + 格式合法）
+> 与
+> superseded sibling 的生效时机（旧 proposal 真正被释放）
+> 必须分离。
+>
+> 只有新 proposal 最终 accepted_for_review，才允许真正释放旧 accepted proposal。
+> 其他终态（blocked / rejected / preflight_failed / conflict）不释放。
+
+**为什么今天不碰**：这是生命周期规则变更，影响 Phase 4 apply 阶段（apply 失败时如何回滚 superseded sibling 也是同类问题）。跟 Phase 4 一起设计比单独改更安全。
+
+**今天怎么绕过的**：path BLOCK 测试路径不带 `supersedes` 字段（设 null）、不改 docker-compose.yml（不撞 9048d1 占位），完全回避了这条语义漏洞。这不是妥协——是测试设计的正确选择。
+
+### baseline invariant BLOCK SOP（暂存，前提未解除）
+
+**为什么还不能跑**：`20260517-123059-9048d1`（HIGH/accepted_for_review）仍占位 docker-compose.yml。新 compose proposal 如果不带 supersedes 会被 conflict 闸门拦（到不了 baseline invariant）；带 supersedes 会触发上面的语义漏洞。
+
+**前提解除条件**（任一即可）：
+- 9048d1 因 cutover/rebuild/合法 supersede 等正常理由闭合
+- 或先修 supersede 语义漏洞（Phase 4 前置）
+
+**修订后的 SOP 要吸收的 4 条 review**（用户提出，全部接受）：
+1. request 用 helper 同款 `jq -n --arg id ... --arg ts ... '{proposal_id:$id, submitted_at:$ts}'` 格式
+2. candidate 改用 python3 exact-once 替换（避免 BSD sed 脆弱性）
+3. 加 `docker compose -f "$PROPOSAL_DIR/docker-compose.yml" config >/dev/null` 验证 parse
+4. manifest 里 supersedes 字段的处理取决于上面语义决议
+
+### 弯路与教训（今晚经验总结）
+
+**1. `${N:-{\}}` 是 bash 3.2 / 5.x 通杀的陷阱**
+
+`\` 在参数展开 `${var:-default}` 里不是转义字符，是字面字符。重构者在 IDE 里"觉得 `{}` 得转义"是写 C 的直觉，在 bash 里会坏事。正确写法：
+
+```bash
+local x="${5:-}"
+[ -z "$x" ] && x='{}'
+```
+
+两步赋值，意图显式，不依赖 bash 参数展开的任何 corner case。
+
+**2. `|| true` 容错 + 静默失败 = split-brain 的经典组合**
+
+`process_request "$id" || true` 是正确的主循环容错（不能因为一个 proposal 让 watcher 死），但它让函数内部任何中间步骤的非零退出**从外层角度消失**——后续副作用（通知、消费、归档）照跑。fix 不是去掉 `|| true`，是让**函数内部自己守序**：write_result 失败就 return 1，finalize 看到 return 1 就不发通知、不消费、不归档。
+
+**3. 测试设计要考虑现场状态（不只是逻辑对不对）**
+
+第一版 baseline invariant BLOCK SOP 闸门 walkthrough 全对（candidate/stale/conflict/global/baseline），但**没把 9048d1 占位代入现场** → conflict 闸门会先拦 → 到不了 baseline invariant。切换到 path BLOCK（第 3 道闸门，在 conflict 之前）完全绕过了这个问题。
+
+**4. 测试不该触发尚未审清的语义副作用**
+
+baseline invariant BLOCK 如果用 `supersedes: 9048d1` 绕过 conflict，会触发"非法 proposal 顶掉合法 proposal"的语义漏洞——这不是测试的 scope，测完后现场变脏了。正确选择是**回避**这条路径，把语义漏洞单独记为 Phase 4 前置。
+
+**5. 通知出口是单一的，但权威 result 才是真相源**
+
+finalize_proposal 的通知读函数参数（不回读 result file）——这本来是好设计（通知不依赖 I/O），但在 write_result 失败时反过来制造了 split-brain。fix 后的契约：**只有 write_result 成功才能走到 notify**——通知的输入仍然是函数参数，但发通知的前提是 result 已落盘。
+
+**6. 文件上传要注意落地目录**
+
+GitHub 网页"Add files via upload"会上传到**当前浏览目录**。如果停在仓库首页，文件就进了根目录而不是 scripts/ops/。跨环境传文件（宿主机没 git push 能力时），用 chat 贴内容比 UI 上传更可控。
+
+### 当前分支拓扑（更新）
+
+```
+ops-watcher-step-b-hotfix-auth-result-invariant   ← 当前生产分支 ★
+    ↓ 提交链（最新在上）
+    393934b  fix(B.3): move ops-watcher.sh to correct path + adopt user's tighter validation
+    2dadbd9  Add files via upload（用户精简版）
+    8644b8e  fix(B.3): authoritative result invariant — eliminate {\} + JSON validity guard
+    81e5a54  docs(B.3): inline self-contained BLOCK tier test SOP for next window
+    5b0eef0  docs(B.3): proposal 3/4 tiers production-verified — LOW MEDIUM HIGH
+    ...（以下同旧 hotfix 分支）
+```
+
+**生产宿主机当前运行**：`393934b` 头部代码（用户版 ops-watcher.sh）。
+watcher 已重启并正常运行（started + heartbeat + BLOCK 通知验证通过）。
+
+### B.3 / B.4 剩余待办
+
+- [ ] B.3 失败路径主动测试（关 SR → LOW proposal → http_code=000 + .notified.txt 不追加 → 恢复 SR → 重提 → .notified.txt 追加）
+- [ ] B.4 launchd plist 开机自启 + heartbeat 端到端覆盖 fswatch tick miss
+- [ ] supersede 语义漏洞修复（Phase 4 前置决议，不是 B.3/B.4 范围）
+- [ ] baseline invariant BLOCK SOP（前提解除后跑）
+- [ ] 负向故障注入 SOP（可选回归：人为让 result 生成非法 JSON，确认不发布 / 不 consume / 不 notify）
+
+### 合并策略（仍按住）
+
+分支名从 `ops-watcher-step-b-hotfix` 演化为 `ops-watcher-step-b-hotfix-auth-result-invariant`。合并时机和方式留到 B.4 完成后再讨论。不主动合并 / rebase。
+
