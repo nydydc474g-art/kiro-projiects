@@ -689,3 +689,74 @@ watcher 双向校验：顶层值 == versions/current 内值，不一致 → WARN
 5. 一次提交推送
 
 完成 Phase 1.2 后才进入 Phase 2（compose 挂载 + watcher 主循环 + 风险分级）。
+
+
+
+---
+
+## Checkpoint：Phase 1.2 完成（2026-05-17）
+
+8 项实测发现修复全部落地，27 项自动化测试通过，生产宿主机上一次跑通。
+
+### 关键交付
+
+- `init-snapshot.sh`：versions/current 相对 symlink + 7 步定序 + 双向校验输出
+- `ops-helper.sh`：30 项硬化（jq -n / 原子更新 / sha256 铆钉 / symlink 防御 / base_snapshot_hash 双锚 / 路径收窄 / verification 必填 / no-op 拒绝 / 等）
+- `README.md`：新结构图 + 保留策略 + 完整验证步骤
+
+### 生产实测（宿主机）
+
+```
+[2026-05-17T06:37:56Z] snapshot refreshed
+  path:   /Users/caimin/ai_sandbox/agent_workspace/.snapshot
+  id:     20260517T063756Z
+  hash:   570f163bdfca5a9792339c3549e9fe83c92952a849f9b80eca0d4b655003307b
+  current → versions/20260517T063756Z
+  versions kept: 1 (no auto-prune in Phase 1.2)
+```
+
+helper 流程 `add → set-effect → set-affected → set-verification → validate → submit` 全链路通过，proposal id 正确含 6 位真随机 hex 后缀（`cfb964`，不再是 SIGPIPE 触发的 `xxx`）。
+
+---
+
+## Phase 2 拆分：Step A + Step B
+
+考虑到上下文预算与代码体量，Phase 2 拆为两步：
+
+### Step A（本轮）：watcher 骨架 + 静态检查 + 本地闭环
+
+不接 Telegram，不动 compose，纯宿主机本地闭环。
+
+待办：
+
+1. `ops-watcher.sh` 主循环（fswatch 监听 ops-requests/）
+2. 静态检查模块：
+   - manifest schema 重校验（不信任 helper 前端）
+   - 全局规则扫描（privileged / docker.sock / ports / host 网络 / 敏感路径挂载）
+   - 路径白名单校验
+   - 隔离临时目录预演（`docker compose config` + `hadolint`）
+   - 风险分级 LOW/MEDIUM/HIGH/BLOCK
+   - stale 检测（base_snapshot_id != current）
+   - 内容漂移检测（base_snapshot_hash != current 顶层）
+   - conflict 检测（同文件已有 pending 且无 supersedes）
+3. `ops_spool/events.jsonl` 审计流
+4. 写 ops-results/<id>.json（含 manifest 完整副本 + applied_files placeholder + watcher_decision）
+5. 紧急停止开关 `.ops-watcher.disabled`
+6. `ops-baseline.json` 安全字段基线
+7. Step A 测试脚本（临时目录模拟 proposal → watcher 处理 → 检查 result）
+
+完成后宿主机：
+```bash
+bash scripts/ops/ops-watcher.sh &
+# 另一终端 submit proposal
+# 看 ops_spool/events.jsonl 和 ops-results 的反应
+```
+
+### Step B（下一轮）：Telegram + compose 挂载 + 真实集成
+
+- compose 中给 agent 加 `.snapshot:ro` 挂载
+- Dockerfile COPY `ops-helper.sh` → `/usr/local/bin/ops-propose`
+- watcher Telegram 通知（4 档 + apply 结果）
+- 集成测试：agent 容器内真实 submit → watcher 实际处理 → Telegram 收到通知
+
+Step B 仍只做"静态检查"，不真实 docker compose up（那是 Phase 4 apply-proposal.sh 的事）。
