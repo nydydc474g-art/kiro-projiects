@@ -2,7 +2,7 @@
 
 > 从空白目录到 6 服务 CC-Only 生产就绪，完整记录每个关键节点与决策。
 
-## 当前状态摘要（2026-05-16）
+## 当前状态摘要（2026-05-17）
 
 | 项目 | 状态 |
 |------|------|
@@ -11,8 +11,9 @@
 | 网络 | sandbox_net internal + squid ACL 白名单强制（deny all 兜底） |
 | 凭据 | agent 内无真实 API key；LLM key 在 litellm 侧，搜索 key 由 search-helper 从环境读取 |
 | 审计 | 全工具 hook → TCP collector（权威）→ notifier → Telegram |
-| 防护 | guard.sh（Bash 阻断）+ guard-read.sh（Read 阻断）+ audit.sh（分级留痕） |
-| E2E | 11 组验证含 squid 实际拒绝测试，全绿 = 安全基座稳定 |
+| 防护 | guard.sh（Bash 阻断 + .git 宽兜底）+ guard-read.sh（Read 阻断）+ audit.sh（分级留痕） |
+| E2E | 原有 11 组 + 扩展 40+ 用例（agent 逃逸威胁模型），全绿 = 安全基座稳定 |
+| CI/CD | GitHub Actions 静态分析（每次 push）+ Docker E2E（手动/每周） |
 | 宿主机暴露 | 仅 `agent_workspace` 目录可写；其余配置/日志均为 :ro 或独立容器 |
 
 > 以下为完整开发历史，按时间线记录。如只需了解当前架构，看上表即可。
@@ -677,3 +678,110 @@ squid_parse_ok
 ```
 
 教训：**配置存在、设计正确、运行可解析，是三件不同的事。** 对代理、网关、ACL 这类基础设施，E2E 不能只看文件内容和外部表现，中间还必须验证组件本身能成功加载配置。
+
+
+
+### Agent 逃逸威胁模型测试 + guard.sh 加固（2026-05-17）
+
+#### 背景
+
+借助 Kiro（外部 AI 协作工具）对项目进行系统性安全审计，目标聚焦于：
+- **测试范围**：agent 被恶意 prompt 引导或误操作后，对 Docker 环境内部的影响
+- **不在范围**：宿主机自身暴露面、Docker daemon 漏洞、人为操作失误
+
+#### 威胁模型定义
+
+| 威胁类别 | 核心问题 |
+|----------|----------|
+| 容器逃逸 | agent 能否突破 Docker 边界触达宿主机 |
+| 网络逃逸 | agent 能否绕过 squid 白名单访问任意外部地址 |
+| 凭据窃取 | agent 能否拿到不属于它的 API key/token |
+| 审计篡改 | agent 能否删除/修改自己的行为记录 |
+| 资源耗尽 | agent 能否 DoS 整个 Docker 环境 |
+| 横向移动 | agent 能否攻击同网络的其他容器 |
+| 持久化 | agent 能否在 workspace 之外写入持久后门 |
+| 防护绕过 | agent 能否绕过 guard.sh 执行高危命令 |
+
+#### guard.sh 加固：.git 宽兜底规则
+
+发现原有正则 `\brm[[:space:]]+-rf\b` 只匹配 flags 连写，以下变体可绕过：
+- `rm -r -f .git`（分离 flags）
+- `rm --recursive --force .git`（长参数）
+- `find .git -type f -delete`（等价命令）
+- `find .git/ -exec rm {} +`（find + exec）
+
+新增两条兜底规则：
+
+```bash
+# 第一条：rm/shred/unlink 任何变体 + .git 目标
+if echo "$cmd_flat" | grep -qiE '(rm|shred|unlink)[^;&|]*(\.git)(/|[[:space:];&|]|$)'; then
+  block "destructive workspace framework pattern"
+fi
+
+# 第二条：find + .git 路径 + 删除动作（-delete 或 -exec rm）
+if echo "$cmd_flat" | grep -qiE 'find[[:space:]][^;&|]*(\.git)(/|[[:space:]])[^;&|]*(-delete|-exec[[:space:]]+rm)'; then
+  block "destructive workspace framework pattern"
+fi
+```
+
+验证结果：23/23 全部通过（11 个攻击被阻断 + 12 个正常操作不误杀）。
+
+误杀分析：
+- `.gitignore` → 不匹配（`.git` 后接 `i`，非边界字符）
+- `.github` → 不匹配（`.git` 后接 `h`，非边界字符）
+- `cat .git/config` → 不匹配（`cat` 不在 rm/shred/unlink/find 列表中）
+
+已知接受的绕过（容器层 + git 恢复兜底）：
+- `perl -e 'rmtree(".git")'`（agent 镜像无 perl）
+- `python3 -c "shutil.rmtree('.git')"`（git 远程 + 宿主机 snapshot 恢复）
+
+设计哲学不变：**guard.sh 是速刹车，git 仓库可恢复是真正兜底。**
+
+#### 新增交付物
+
+| 文件 | 作用 |
+|------|------|
+| `scripts/e2e-extended-test.sh` | 40+ 用例 agent 逃逸威胁模型测试（10 组：T1~T10） |
+| `.github/workflows/security-checks.yml` | 静态安全分析 CI（shellcheck + python lint + 配置一致性 + Dockerfile 扫描 + compose 不变量） |
+| `.github/workflows/e2e-security.yml` | Docker Compose E2E 安全测试（手动触发或每周日运行） |
+| `.gitignore` | 防止 audit-collector.jsonl、.env 等敏感文件误提交 |
+
+#### 扩展测试组结构
+
+| 组 | 威胁 | 性质 |
+|---|------|------|
+| T1 | 容器逃逸边界（read-only / cap / socket / mount / no-new-priv） | 硬性 |
+| T2 | 网络逃逸（直连 / squid / IP 绕过 / 非 443 / DNS） | 硬性 |
+| T3 | 凭据窃取（env / litellm 管理接口 / /proc / .claude 内容） | 硬性 |
+| T4 | 审计韧性（不可写 / 不可删 / 噪声注入 / rate limit） | 混合 |
+| T5 | 资源耗尽（PID / tmpfs / 内存 / 只读 fs） | 硬性 |
+| T6 | guard.sh 绕过（命令变体 / 间接执行 / Git 操作 + 对照组） | 混合 |
+| T7 | 横向移动（collector / litellm / squid / notifier / 管理接口） | 混合 |
+| T8 | 持久化（tmpfs / .claude :ro / 运行时 hook / 唯一持久路径） | 混合 |
+| T9 | 域名劫持（extra_hosts / /etc/hosts 只读） | 硬性 |
+| T10 | Workspace 破坏（可写确认 / find -delete / 磁盘填满） | 信息性 |
+
+#### 本机验证步骤
+
+```bash
+cd /Users/caimin/ai_sandbox
+
+# 1. 同步新版 guard.sh 到生产 hook 目录
+cp <PR分支>/guard.sh claude_config/hooks/guard.sh
+
+# 2. 重启 agent 使新 hook 生效
+docker compose restart agent
+
+# 3. 运行扩展安全测试
+chmod +x scripts/e2e-extended-test.sh
+./scripts/e2e-extended-test.sh
+
+# 4. 运行原有 E2E 回归（确认不 break）
+./scripts/e2e-test.sh
+```
+
+#### PR 信息
+
+- 分支：`security-testing-suite`
+- PR：https://github.com/nydydc474g-art/kiro-projiects/pull/1
+- 状态：待本机验证
