@@ -306,6 +306,54 @@ docker compose exec agent rm -rf /app/workspace/.tmp/gemini-*
 
 ---
 
+## 安全测试
+
+### 扩展安全测试（Agent 逃逸威胁模型）
+
+除原有 11 组 E2E 回归测试外，新增 `scripts/e2e-extended-test.sh`（40+ 用例），专门验证 agent 在被恶意引导或误操作后的影响边界。
+
+```bash
+cd /Users/caimin/ai_sandbox
+chmod +x scripts/e2e-extended-test.sh
+./scripts/e2e-extended-test.sh
+```
+
+运行时间约 2~3 分钟。T5.1 PID 测试后会自动重启 agent。
+
+### 测试覆盖（10 组）
+
+| 组 | 验证内容 | 预期 |
+|----|----------|------|
+| T1 | 容器逃逸边界（read-only / cap / socket / mount / no-new-priv） | 全 ✅ |
+| T2 | 网络逃逸（直连 / squid / IP / 非443 / DNS） | 全 ✅ |
+| T3 | 凭据窃取（env / litellm / /proc / .claude） | ✅ + 1 ⚠️ |
+| T4 | 审计韧性（不可写 / 不可删 / 噪声 / rate limit） | ✅ + 1 ⚠️ |
+| T5 | 资源耗尽（PID / tmpfs / 内存 / 只读） | ✅ + 1 ⚠️ |
+| T6 | guard.sh 绕过（命令变体 / 间接执行 / Git） | ✅ + ⚠️ 已知 |
+| T7 | 横向移动（collector / litellm / squid / notifier） | ✅ + 1 ⚠️ |
+| T8 | 持久化（tmpfs / .claude :ro / hook / 唯一路径） | ✅ + 1 ⚠️ |
+| T9 | 域名劫持（extra_hosts / /etc/hosts） | 全 ✅ |
+| T10 | Workspace 破坏（可写 / find -delete / 磁盘） | ⚠️ 设计如此 |
+
+### 结果解读
+
+- **✅ PASS**：安全边界验证通过
+- **⚠️ WARN**：已知设计权衡，有兜底机制（git 恢复 / 容器层 / 重启恢复）
+- **❌ FAIL**：需要立即修复的安全漏洞（正常运行不应有）
+
+### 已知 WARN 说明
+
+| WARN | 原因 | 兜底 |
+|------|------|------|
+| litellm 模型列表可见 | master_key = dummy token | 不泄露真实 API key |
+| collector 噪声注入 | agent 可 TCP 发任意 JSON | 不能删改真实记录 |
+| 内存 overcommit | macOS Docker 平台行为 | 真实负载下 OOM kill 生效 |
+| guard.sh 间接执行绕过 | 正则无法覆盖所有间接路径 | squid 白名单 + 容器隔离 |
+| 运行时 hook 可临时修改 | tmpfs 上的副本 | 重启恢复 + /app/.claude :ro |
+| workspace find -delete | guard.sh 不拦非 .git 路径 | git 仓库可恢复 |
+
+---
+
 ## 参考文件
 
 | 文件 | 内容 |

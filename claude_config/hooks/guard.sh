@@ -76,6 +76,14 @@ if echo "$cmd_flat" | grep -qiE '(^|[[:space:]])[^;|&]*\.gemini/[^;|&]*'; then
   block "credential directory access attempt"
 fi
 
+# 宽兜底：任何删除语义命令针对 .git 目录（防 rm -r -f / find -delete / shred 等变体绕过）
+if echo "$cmd_flat" | grep -qiE '(rm|shred|unlink)[^;&|]*(\.git)(/|[[:space:];&|]|$)'; then
+  block "destructive workspace framework pattern"
+fi
+if echo "$cmd_flat" | grep -qiE 'find[[:space:]][^;&|]*(\.git)(/|[[:space:]])[^;&|]*(-delete|-exec[[:space:]]+rm)'; then
+  block "destructive workspace framework pattern"
+fi
+
 if echo "$cmd_flat" | grep -qiE '\brm[[:space:]]+-[A-Za-z]*r[A-Za-z]*[[:space:]]+([^;&|]*[[:space:]])*([^[:space:];&|]*/)?(\.git|inbox|output|scratch|exports)(/|[[:space:];&|]|$)'; then
   block "destructive workspace framework pattern"
 fi

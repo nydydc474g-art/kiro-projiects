@@ -1,0 +1,320 @@
+name: Security & Lint Checks
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'Dockerfile'
+      - 'docker-compose.yml'
+      - 'squid.conf'
+      - 'allowed_domains.txt'
+      - 'guard.sh'
+      - 'guard-read.sh'
+      - 'audit.sh'
+      - 'stop-summary.sh'
+      - 'collector.py'
+      - 'notifier.py'
+      - 'search-helper.py'
+      - 'settings.json'
+      - 'litellm_config.yaml'
+      - 'scripts/**'
+      - '.github/workflows/**'
+  pull_request:
+    branches: [main]
+
+jobs:
+  # ============================================================
+  # Job 1: Shell 脚本静态分析
+  # ============================================================
+  shellcheck:
+    name: ShellCheck Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install shellcheck
+        run: sudo apt-get install -y shellcheck
+
+      - name: Check guard.sh
+        run: shellcheck --severity=warning guard.sh
+
+      - name: Check guard-read.sh
+        run: shellcheck --severity=warning guard-read.sh
+
+      - name: Check audit.sh
+        run: shellcheck --severity=warning audit.sh
+
+      - name: Check stop-summary.sh
+        run: shellcheck --severity=warning stop-summary.sh
+
+      - name: Check e2e-test.sh
+        run: shellcheck --severity=warning e2e-test.sh
+
+      - name: Check e2e-extended-test.sh
+        run: shellcheck --severity=warning scripts/e2e-extended-test.sh
+
+  # ============================================================
+  # Job 2: Python 代码质量
+  # ============================================================
+  python-lint:
+    name: Python Lint & Type Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install tools
+        run: pip install ruff mypy requests
+
+      - name: Ruff lint
+        run: ruff check collector.py notifier.py search-helper.py gateway.py
+
+      - name: Python syntax check
+        run: |
+          python -m py_compile collector.py
+          python -m py_compile notifier.py
+          python -m py_compile search-helper.py
+          python -m py_compile gateway.py
+
+  # ============================================================
+  # Job 3: 配置一致性验证
+  # ============================================================
+  config-consistency:
+    name: Configuration Consistency
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install tools
+        run: pip install pyyaml
+
+      - name: Validate docker-compose.yml syntax
+        run: |
+          python -c "
+          import yaml, sys
+          with open('docker-compose.yml') as f:
+              data = yaml.safe_load(f)
+          services = list(data.get('services', {}).keys())
+          print(f'Services: {services}')
+          assert len(services) >= 6, f'Expected >= 6 services, got {len(services)}'
+          print('✅ docker-compose.yml valid')
+          "
+
+      - name: Validate litellm_config.yaml syntax
+        run: |
+          python -c "
+          import yaml
+          with open('litellm_config.yaml') as f:
+              data = yaml.safe_load(f)
+          models = data.get('model_list', [])
+          print(f'Models: {len(models)}')
+          # 验证没有硬编码 key
+          raw = open('litellm_config.yaml').read()
+          assert 'sk-' not in raw, 'litellm_config contains hardcoded key!'
+          print('✅ litellm_config.yaml valid, no hardcoded keys')
+          "
+
+      - name: Validate settings.json
+        run: |
+          python -c "
+          import json
+          with open('settings.json') as f:
+              data = json.load(f)
+          hooks = data.get('hooks', {})
+          # 验证所有必要 hook 注册
+          assert 'PreToolUse' in hooks, 'PreToolUse hooks missing'
+          assert 'PostToolUse' in hooks, 'PostToolUse hooks missing'
+          assert 'Stop' in hooks, 'Stop hooks missing'
+          # 验证 audit.sh 全工具覆盖（无 matcher 限制）
+          pre_hooks = hooks['PreToolUse']
+          has_global_audit = any(
+              h for h in pre_hooks
+              if 'matcher' not in h and any('audit.sh' in hook.get('command','') for hook in h.get('hooks',[]))
+          )
+          assert has_global_audit, 'audit.sh must be registered without matcher (global)'
+          print('✅ settings.json valid')
+          "
+
+      - name: Validate squid.conf security
+        run: |
+          python -c "
+          import sys
+          content = open('squid.conf').read()
+          # 必须有 deny all 兜底
+          assert 'http_access deny all' in content, 'squid.conf missing deny all!'
+          # 必须引用白名单文件
+          assert 'allowed_domains.txt' in content, 'squid.conf not referencing whitelist file!'
+          # 不能有 allow all
+          lines = [l.strip() for l in content.splitlines() if l.strip() and not l.strip().startswith('#')]
+          for line in lines:
+              if 'http_access allow all' in line:
+                  print('❌ squid.conf contains http_access allow all!')
+                  sys.exit(1)
+          print('✅ squid.conf security checks passed')
+          "
+
+      - name: Cross-validate allowed_domains.txt
+        run: |
+          python -c "
+          required = [
+              'api.anthropic.com', 'api.deepseek.com', 'api.telegram.org',
+              'github.com', 'pypi.org', 'registry.npmjs.org',
+          ]
+          with open('allowed_domains.txt') as f:
+              domains = [l.strip() for l in f if l.strip() and not l.startswith('#')]
+          for d in required:
+              assert d in domains, f'Missing required domain: {d}'
+          # 检查重复（会导致 squid 6 拒绝启动）
+          seen = set()
+          for d in domains:
+              # .example.com 和 example.com 不算重复
+              if d in seen:
+                  print(f'❌ Duplicate domain: {d}')
+                  exit(1)
+              seen.add(d)
+          print(f'✅ allowed_domains.txt valid ({len(domains)} domains, no duplicates)')
+          "
+
+  # ============================================================
+  # Job 4: Dockerfile 安全扫描
+  # ============================================================
+  dockerfile-security:
+    name: Dockerfile Security Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install hadolint
+        run: |
+          wget -O hadolint https://github.com/hadolint/hadolint/releases/download/v2.12.0/hadolint-Linux-x86_64
+          chmod +x hadolint
+          sudo mv hadolint /usr/local/bin/
+
+      - name: Lint Dockerfile
+        run: hadolint --ignore DL3008 --ignore DL3013 Dockerfile
+
+      - name: Security assertions
+        run: |
+          python3 -c "
+          content = open('Dockerfile').read()
+          # 不能以 root 结尾
+          lines = [l.strip() for l in content.splitlines() if l.strip() and not l.startswith('#')]
+          assert 'USER developer' in content or 'USER 1000' in content, 'Dockerfile must switch to non-root user'
+          # 不能安装 sudo
+          assert 'sudo' not in content, 'Dockerfile should not install sudo'
+          # 不能 EXPOSE 端口（agent 不监听）
+          assert 'EXPOSE' not in content, 'agent Dockerfile should not EXPOSE any port'
+          print('✅ Dockerfile security checks passed')
+          "
+
+  # ============================================================
+  # Job 5: docker-compose 安全不变量验证
+  # ============================================================
+  compose-security:
+    name: Compose Security Invariants
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install tools
+        run: pip install pyyaml
+
+      - name: Verify agent security hardening
+        run: |
+          python3 -c "
+          import yaml, sys
+
+          with open('docker-compose.yml') as f:
+              compose = yaml.safe_load(f)
+
+          agent = compose['services']['agent']
+
+          # 安全不变量检查
+          checks = []
+
+          # 1. read_only
+          checks.append(('read_only', agent.get('read_only') == True))
+
+          # 2. cap_drop ALL
+          caps = agent.get('cap_drop', [])
+          checks.append(('cap_drop_ALL', 'ALL' in caps))
+
+          # 3. no-new-privileges
+          sec_opts = agent.get('security_opt', [])
+          checks.append(('no_new_privileges', 'no-new-privileges:true' in sec_opts))
+
+          # 4. 资源限制存在
+          checks.append(('mem_limit', 'mem_limit' in agent))
+          checks.append(('cpus', 'cpus' in agent))
+          checks.append(('pids_limit', 'pids_limit' in agent))
+
+          # 5. audit_spool 挂载为 :ro
+          volumes = agent.get('volumes', [])
+          audit_ro = any(':ro' in v and 'audit_spool' in v for v in volumes)
+          checks.append(('audit_spool_ro', audit_ro))
+
+          # 6. 网络只有 sandbox_net
+          networks = agent.get('networks', [])
+          if isinstance(networks, list):
+              checks.append(('only_sandbox_net', networks == ['sandbox_net']))
+          elif isinstance(networks, dict):
+              checks.append(('only_sandbox_net', list(networks.keys()) == ['sandbox_net']))
+
+          # 7. ANTHROPIC_API_KEY 是 dummy
+          env_list = agent.get('environment', [])
+          anthro_key = [e for e in env_list if 'ANTHROPIC_API_KEY' in str(e)]
+          checks.append(('dummy_api_key', any('sandbox-dummy-token' in str(k) for k in anthro_key)))
+
+          # 8. extra_hosts 劫持 anthropic 域名
+          extra = agent.get('extra_hosts', [])
+          checks.append(('extra_hosts_anthropic', any('api.anthropic.com' in h for h in extra)))
+
+          # 汇总
+          failed = [name for name, ok in checks if not ok]
+          for name, ok in checks:
+              status = '✅' if ok else '❌'
+              print(f'  {status} {name}')
+
+          if failed:
+              print(f'\n❌ Failed checks: {failed}')
+              sys.exit(1)
+          print('\n✅ All agent security invariants verified')
+          "
+
+      - name: Verify network isolation
+        run: |
+          python3 -c "
+          import yaml, sys
+
+          with open('docker-compose.yml') as f:
+              compose = yaml.safe_load(f)
+
+          networks = compose.get('networks', {})
+
+          # sandbox_net 必须是 internal
+          sandbox = networks.get('sandbox_net', {})
+          assert sandbox.get('internal') == True, 'sandbox_net must be internal: true'
+
+          # internet_access 不能是 internal
+          internet = networks.get('internet_access', {})
+          assert internet.get('internal', False) == False, 'internet_access should not be internal'
+
+          # agent 不能在 internet_access 网络
+          agent_networks = compose['services']['agent'].get('networks', [])
+          if isinstance(agent_networks, dict):
+              agent_networks = list(agent_networks.keys())
+          assert 'internet_access' not in agent_networks, 'agent must NOT be on internet_access network!'
+
+          print('✅ Network isolation verified')
+          "
