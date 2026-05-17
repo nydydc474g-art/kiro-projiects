@@ -3,21 +3,35 @@
 # 初始化或刷新 .snapshot/ — agent 只读快照
 # 用途：watcher 启动时调用；apply 成功后调用以更新快照
 #
-# 设计要点：
-#   - 严格白名单复制，绝不包含 .env / audit_spool / .git / cliproxyapi/auths
-#   - 原子刷新：rsync 到临时目录 → mv 替换，避免 agent 在中途读到半成品
-#   - 写入 .snapshot-id（时间戳）+ .snapshot-hash（内容哈希），双校验防漂移
+# Phase 1.2 设计：
+#   .snapshot/                     ← 稳定挂载点（compose bind mount 不变）
+#     versions/
+#       <snapshot-id>/             ← 每次 refresh 创建新版本目录
+#         .snapshot-id
+#         .snapshot-hash
+#         <files>
+#     current -> versions/<id>     ← 相对 symlink（整目录搬走仍自洽）
+#     .snapshot-id                 ← 顶层指针，方便 agent helper 读
+#     .snapshot-hash               ← 顶层指针
+#
+# refresh 7 步定序：
+#   1. 构建 versions/<new-id>.staging/
+#   2. 写入 .snapshot-id / .snapshot-hash 到 staging 内
+#   3. mv staging → versions/<new-id>           (原子)
+#   4. ln -sfn "versions/<new-id>" current.new  (相对路径)
+#   5. mv current.new current                    (原子切换)
+#   6. 顶层 metadata 原子写（.snapshot-id / .snapshot-hash）
+#   7. 双向校验（顶层 == versions/current 内）
 
 set -eo pipefail
 
 PROJECT_DIR="${PROJECT_DIR:-$HOME/ai_sandbox}"
 WORKSPACE_DIR="$PROJECT_DIR/agent_workspace"
 SNAPSHOT_DIR="$WORKSPACE_DIR/.snapshot"
+VERSIONS_DIR="$SNAPSHOT_DIR/versions"
 
-# SNAPSHOT_INCLUDED：agent 通过 .snapshot 可读的"生产现状"
+# SNAPSHOT_INCLUDED：agent 通过 .snapshot/current 可读的"生产现状"
 # 注意：这与 PROPOSAL_PATH_ALLOWED 不同——见 OPS-WATCHER-DESIGN.md
-# claude_config/ 在这里（agent 能看到当前防线）
-# 但不在 PROPOSAL_PATH_ALLOWED 内（agent 不能提案改动）
 INCLUDE_PATHS=(
   "docker-compose.yml"
   "Dockerfile"
@@ -29,7 +43,7 @@ INCLUDE_PATHS=(
   "claude_config"
 )
 
-# 排除模式（即使在 INCLUDE 内也不进 snapshot）
+# 排除模式
 EXCLUDE_PATTERNS=(
   ".env"
   ".env.*"
@@ -40,13 +54,12 @@ EXCLUDE_PATTERNS=(
   "*.pyc"
 )
 
-# 必备命令：优先 rsync，fallback 到 cp（macOS 默认有 rsync）
+# 工具发现
 USE_RSYNC=1
 if ! command -v rsync >/dev/null 2>&1; then
   USE_RSYNC=0
 fi
 
-# macOS 用 shasum -a 256，Linux 用 sha256sum
 if command -v sha256sum >/dev/null 2>&1; then
   SHA256_CMD="sha256sum"
 elif command -v shasum >/dev/null 2>&1; then
@@ -56,12 +69,18 @@ else
   exit 1
 fi
 
-# 准备工作
-mkdir -p "$WORKSPACE_DIR"
+mkdir -p "$WORKSPACE_DIR" "$SNAPSHOT_DIR" "$VERSIONS_DIR"
 
-# 临时构建目录（在同一文件系统上，保证 mv 原子）
-STAGING_DIR=$(mktemp -d "$WORKSPACE_DIR/.snapshot.staging.XXXXXX")
-trap 'rm -rf "$STAGING_DIR"' EXIT
+# 生成 snapshot ID
+SNAPSHOT_ID=$(date -u +"%Y%m%dT%H%M%SZ")
+
+# === Step 1: 构建 staging 目录 ===
+STAGING_DIR="$VERSIONS_DIR/${SNAPSHOT_ID}.staging"
+if [ -e "$STAGING_DIR" ]; then
+  rm -rf "$STAGING_DIR"
+fi
+mkdir -p "$STAGING_DIR"
+trap 'rm -rf "$STAGING_DIR" "$VERSIONS_DIR/$SNAPSHOT_ID.staging" 2>/dev/null || true' EXIT
 
 # 构建 rsync 排除参数
 EXCLUDE_ARGS=()
@@ -69,13 +88,11 @@ for ex in "${EXCLUDE_PATTERNS[@]}"; do
   EXCLUDE_ARGS+=(--exclude="$ex")
 done
 
-# 复制白名单路径到 staging
 copy_with_excludes() {
   local src="$1" dest="$2"
   if [ "$USE_RSYNC" = "1" ]; then
     rsync -a "${EXCLUDE_ARGS[@]}" "$src/" "$dest/"
   else
-    # cp -r + find 删除 fallback
     cp -r "$src/." "$dest/"
     for ex in "${EXCLUDE_PATTERNS[@]}"; do
       find "$dest" -name "$ex" -prune -exec rm -rf {} + 2>/dev/null || true
@@ -97,15 +114,10 @@ for p in "${INCLUDE_PATHS[@]}"; do
   fi
 done
 
-# 生成 snapshot ID（UTC 时间戳）
-SNAPSHOT_ID=$(date -u +"%Y%m%dT%H%M%SZ")
+# === Step 2: 写入元数据到 staging ===
 echo "$SNAPSHOT_ID" > "$STAGING_DIR/.snapshot-id"
 
-# 生成内容哈希：只算业务文件内容（排除 .snapshot-id 和 .snapshot-hash 自身）
-# 这样：
-#   - snapshot-id 不同 + hash 相同 = 同秒/快速重刷无内容变化 → 可接受
-#   - snapshot-id 相同 + hash 不同 = 时间戳没变但内容漂了 → 异常，需告警
-#   - snapshot-id 不同 + hash 不同 = 正常的内容变更
+# 计算内容哈希：排除 .snapshot-id 和 .snapshot-hash 自身
 SNAPSHOT_HASH=$(
   cd "$STAGING_DIR" && \
   find . -type f ! -name '.snapshot-hash' ! -name '.snapshot-id' -print0 | \
@@ -116,24 +128,58 @@ SNAPSHOT_HASH=$(
 )
 echo "$SNAPSHOT_HASH" > "$STAGING_DIR/.snapshot-hash"
 
-# 原子替换：先把旧 snapshot 移到一边，再把 staging 上位
-# 这一步要尽量短，避免 agent 看到中间状态
-OLD_BACKUP=""
-if [ -d "$SNAPSHOT_DIR" ]; then
-  OLD_BACKUP=$(mktemp -d "$WORKSPACE_DIR/.snapshot.old.XXXXXX")
-  mv "$SNAPSHOT_DIR" "$OLD_BACKUP/snapshot"
+# === Step 3: 原子提交 staging → versions/<id> ===
+VERSION_DIR="$VERSIONS_DIR/$SNAPSHOT_ID"
+if [ -e "$VERSION_DIR" ]; then
+  # 同 ID 已存在（同秒重刷），先移走旧的
+  rm -rf "$VERSION_DIR"
 fi
-mv "$STAGING_DIR" "$SNAPSHOT_DIR"
+mv "$STAGING_DIR" "$VERSION_DIR"
 
-# 清理旧 snapshot
-if [ -n "$OLD_BACKUP" ]; then
-  rm -rf "$OLD_BACKUP"
+# === Step 4-5: 切换 current symlink（相对路径 + 原子 mv）===
+# 在 SNAPSHOT_DIR 内创建 current.new，再 mv 到 current
+# 用 mv 实现原子替换（rename(2) 是原子的）
+cd "$SNAPSHOT_DIR"
+ln -sfn "versions/$SNAPSHOT_ID" "current.new"
+mv -f "current.new" "current"
+cd - >/dev/null
+
+# === Step 6: 顶层 metadata 原子写 ===
+# 先写 .new，再 mv，避免半成品被读到
+echo "$SNAPSHOT_ID" > "$SNAPSHOT_DIR/.snapshot-id.new"
+mv -f "$SNAPSHOT_DIR/.snapshot-id.new" "$SNAPSHOT_DIR/.snapshot-id"
+echo "$SNAPSHOT_HASH" > "$SNAPSHOT_DIR/.snapshot-hash.new"
+mv -f "$SNAPSHOT_DIR/.snapshot-hash.new" "$SNAPSHOT_DIR/.snapshot-hash"
+
+# === Step 7: 双向校验 ===
+TOP_ID=$(cat "$SNAPSHOT_DIR/.snapshot-id")
+TOP_HASH=$(cat "$SNAPSHOT_DIR/.snapshot-hash")
+INNER_ID=$(cat "$SNAPSHOT_DIR/current/.snapshot-id")
+INNER_HASH=$(cat "$SNAPSHOT_DIR/current/.snapshot-hash")
+
+VERIFY_OK=1
+if [ "$TOP_ID" != "$INNER_ID" ]; then
+  echo "WARN: snapshot-id mismatch (top=$TOP_ID, current=$INNER_ID)" >&2
+  VERIFY_OK=0
+fi
+if [ "$TOP_HASH" != "$INNER_HASH" ]; then
+  echo "WARN: snapshot-hash mismatch (top=$TOP_HASH, current=$INNER_HASH)" >&2
+  VERIFY_OK=0
 fi
 
-# trap 不需要再清 staging（已被 mv 走）
+# 校验完成，trap 不再需要清理
 trap - EXIT
 
-echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] snapshot refreshed"
-echo "  path: $SNAPSHOT_DIR"
-echo "  id:   $SNAPSHOT_ID"
-echo "  hash: $SNAPSHOT_HASH"
+if [ "$VERIFY_OK" = "1" ]; then
+  echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] snapshot refreshed"
+else
+  echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] snapshot refreshed WITH WARNINGS"
+fi
+echo "  path:   $SNAPSHOT_DIR"
+echo "  id:     $SNAPSHOT_ID"
+echo "  hash:   $SNAPSHOT_HASH"
+echo "  current → versions/$SNAPSHOT_ID"
+
+# 列出当前所有版本（不自动 prune）
+N_VERSIONS=$(find "$VERSIONS_DIR" -mindepth 1 -maxdepth 1 -type d ! -name '*.staging' 2>/dev/null | wc -l | tr -d ' ')
+echo "  versions kept: $N_VERSIONS (no auto-prune in Phase 1.2)"
