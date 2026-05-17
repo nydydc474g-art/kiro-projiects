@@ -49,6 +49,12 @@ PROPOSALS_ARCHIVE="$OPS_SPOOL_DIR/proposals"
 DISABLED_FLAG="$PROJECT_DIR/.ops-watcher.disabled"
 BASELINE_FILE="$PROJECT_DIR/scripts/ops/ops-baseline.json"
 
+# B.2: Telegram 单向通知配置
+TELEGRAM_ENV_FILE="$PROJECT_DIR/.ops-watcher.env"
+NOTIFIED_FILE="$OPS_SPOOL_DIR/.notified.txt"   # proposal 通知幂等表（仅 proposal，不含 lifecycle 事件）
+LIFECYCLE_STATE_FILE="$OPS_SPOOL_DIR/.lifecycle-state"  # 边沿检测：disabled / enabled
+TELEGRAM_DISABLED=0  # load_telegram_env 可置 1 关闭通知（不影响 watcher 主流程）
+
 # Polling fallback interval (when fswatch absent)
 POLL_INTERVAL=2
 
@@ -264,6 +270,231 @@ consume_request() {
   if [ -f "$req" ]; then
     mkdir -p "$REQUESTS_DIR/.processed"
     mv "$req" "$REQUESTS_DIR/.processed/$id.json" 2>/dev/null || rm -f "$req"
+  fi
+}
+
+# ===== B.2: Telegram 单向摘要通知 =====
+#
+# 设计边界（不可逾越）：
+# 1. 单向：只 sendMessage，永远不调 getUpdates / 不开 webhook
+# 2. 通知策略 = status × risk matrix（不只看 risk 档位）：
+#    推送：accepted_for_review × {LOW,MEDIUM,HIGH}; blocked × BLOCK
+#    静默（仅写 events.jsonl）：conflict / stale / rejected / preflight_failed /
+#                               disabled / superseded
+# 3. 幂等：proposal 通知用 (id, status, risk) 三元组去重，写 .notified.txt
+#    幂等只在 sendMessage HTTP 200 之后才写——失败永不伪装为已通知
+# 4. lifecycle 事件（started/stopped/disabled/resumed）不写幂等表
+#    （否则 watcher 第二次启动就发不出 started）
+# 5. 失败不阻断：Telegram POST 失败只写 events.jsonl ERROR，watcher 主流程不感知
+# 6. superseded sibling 静默：依赖 Phase 4 apply 阶段二次 effective_status 校验兜底
+#    （Telegram 只说"它曾值得看"，apply 必须查"它现在还值不值得 apply"）
+
+# 启动时加载 Telegram env；权限不对则降级（不崩）
+load_telegram_env() {
+  if [ ! -f "$TELEGRAM_ENV_FILE" ]; then
+    TELEGRAM_DISABLED=1
+    write_event "warning" "telegram disabled: env file missing" "" \
+      "$(jq -n --arg f "$TELEGRAM_ENV_FILE" '{env_file: $f, reason: "missing"}')"
+    return 0
+  fi
+
+  local perms
+  if [ "$(uname)" = "Darwin" ]; then
+    perms=$(stat -f "%A" "$TELEGRAM_ENV_FILE" 2>/dev/null || echo "")
+  else
+    perms=$(stat -c "%a" "$TELEGRAM_ENV_FILE" 2>/dev/null || echo "")
+  fi
+  if [ "$perms" != "600" ]; then
+    TELEGRAM_DISABLED=1
+    write_event "warning" "telegram disabled: env file perms not 600" "" \
+      "$(jq -n --arg f "$TELEGRAM_ENV_FILE" --arg p "$perms" '{env_file: $f, perms: $p, expected: "600"}')"
+    return 0
+  fi
+
+  set -a
+  # shellcheck disable=SC1090
+  . "$TELEGRAM_ENV_FILE"
+  set +a
+
+  if [ -z "${TELEGRAM_BOT_TOKEN:-}" ] || [ -z "${TELEGRAM_CHAT_ID:-}" ]; then
+    TELEGRAM_DISABLED=1
+    write_event "warning" "telegram disabled: required vars missing" "" \
+      '{"missing":"TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID"}'
+    return 0
+  fi
+
+  TELEGRAM_DISABLED=0
+}
+
+# 决策：(status, risk) → 是否推送 proposal 通知
+# 推送：accepted_for_review × LOW/MEDIUM/HIGH; blocked × BLOCK
+# 其他全部静默
+should_notify_proposal() {
+  local status="$1" risk="$2"
+  case "$status" in
+    accepted_for_review)
+      case "$risk" in
+        LOW|MEDIUM|HIGH) return 0 ;;
+        *) return 1 ;;
+      esac
+      ;;
+    blocked)
+      [ "$risk" = "BLOCK" ] && return 0 || return 1
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+# 文案分层：LOW/MEDIUM/HIGH/BLOCK
+# 不带 manifest 自由文本 hunks（防 agent 借 Telegram 留言）；reason 截断 200 字符
+format_proposal_message() {
+  local id="$1" status="$2" risk="$3"
+  local result_file="$RESULTS_DIR/$id.json"
+  [ -f "$result_file" ] || { echo "(missing result for $id)"; return; }
+
+  local reason paths n_changes svcs
+  reason=$(jq -r '.manifest.reason // ""' "$result_file" | head -c 200)
+  paths=$(jq -r '[.manifest.changes[].path] | join(", ")' "$result_file" 2>/dev/null || echo "")
+  n_changes=$(jq -r '[.manifest.changes[] | "\(.path) (\(.summary // "modify"))"] | join(", ")' "$result_file" 2>/dev/null || echo "")
+  svcs=$(jq -r '.manifest.affected_services // [] | join(",")' "$result_file" 2>/dev/null || echo "")
+  local watcher_reason
+  watcher_reason=$(jq -r '.reason // ""' "$result_file" | head -c 200)
+
+  local short="${id##*-}"  # 取 id 末段（hex 后缀）方便手机阅读
+
+  case "$risk" in
+    LOW)
+      printf '✅ ops %s\n   %s · LOW · %s\n   %s\n   reason: %s\n   apply: ops %s' \
+        "$short" "$status" "$svcs" "$n_changes" "$reason" "$short"
+      ;;
+    MEDIUM)
+      printf '🟡 ops %s\n   %s · MEDIUM · %s\n   %s\n   reason: %s\n   apply: ops %s\n   diff:  ops-diff %s' \
+        "$short" "$status" "$svcs" "$n_changes" "$reason" "$short" "$short"
+      ;;
+    HIGH)
+      printf '🔴 ops %s · HIGH RISK — REVIEW CAREFULLY\n   %s · HIGH · %s\n   %s\n   reason: %s\n   review: ops-diff %s\n   apply (must use --high): ops-apply --high %s' \
+        "$short" "$status" "$svcs" "$n_changes" "$reason" "$short" "$short"
+      ;;
+    BLOCK)
+      printf '🚨 BLOCKED · ops %s — agent attempted invariant touch\n   reason: %s\n   path: %s\n   audit: ops-spool view %s\n   (no apply — review agent behavior)' \
+        "$short" "$watcher_reason" "$paths" "$short"
+      ;;
+    *)
+      printf 'ops %s · %s · %s\n   %s' "$short" "$status" "$risk" "$n_changes"
+      ;;
+  esac
+}
+
+# Telegram POST；成功返回 0，失败返回 1（调用方决定要不要记 events.jsonl）
+# 失败不抛错——curl 退出非 0 是常态（网络抖动/token 错），不让 watcher 主流程崩
+send_telegram_raw() {
+  local text="$1"
+  [ "$TELEGRAM_DISABLED" = "1" ] && return 1
+  if ! command -v curl >/dev/null 2>&1; then
+    return 1
+  fi
+  local http_code
+  http_code=$(curl -sS -o /dev/null -w "%{http_code}" \
+    --max-time 10 \
+    -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+    --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+    --data-urlencode "text=${text}" \
+    --data-urlencode "disable_web_page_preview=true" \
+    2>/dev/null) || return 1
+  [ "$http_code" = "200" ] || return 1
+  return 0
+}
+
+# 发 proposal 通知 + 幂等去重
+# 关键：只有 sendMessage 成功才追加 .notified.txt
+# 失败永远不写 .notified.txt——一次网络故障不能伪装成"已通知"
+notify_proposal() {
+  local id="$1" status="$2" risk="$3"
+  [ "$TELEGRAM_DISABLED" = "1" ] && return 0
+  should_notify_proposal "$status" "$risk" || return 0
+
+  local key="${id}:${status}:${risk}"
+  if [ -f "$NOTIFIED_FILE" ] && grep -qxF "$key" "$NOTIFIED_FILE"; then
+    return 0
+  fi
+
+  local msg
+  msg=$(format_proposal_message "$id" "$status" "$risk")
+
+  if send_telegram_raw "$msg"; then
+    mkdir -p "$(dirname "$NOTIFIED_FILE")"
+    echo "$key" >> "$NOTIFIED_FILE"
+    write_event "info" "telegram sent" "$id" \
+      "$(jq -n --arg s "$status" --arg r "$risk" '{kind: "proposal", status: $s, risk: $r}')"
+  else
+    write_event "error" "telegram send failed" "$id" \
+      "$(jq -n --arg s "$status" --arg r "$risk" '{kind: "proposal", status: $s, risk: $r}')"
+  fi
+}
+
+# Lifecycle 事件通知（不进幂等表）
+# 边沿检测：disabled/resumed 只在 .ops-watcher.disabled 状态切换时发
+# 当前 lifecycle state 存 .lifecycle-state（仅 enabled/disabled 两种）
+notify_lifecycle() {
+  local kind="$1"  # started | stopped | disabled | resumed
+  local extra="${2:-}"
+  [ "$TELEGRAM_DISABLED" = "1" ] && return 0
+
+  local msg
+  case "$kind" in
+    started)
+      msg="ℹ️ ops-watcher started"
+      [ -n "$extra" ] && msg="$msg ($extra)"
+      ;;
+    stopped)
+      msg="ℹ️ ops-watcher stopped"
+      [ -n "$extra" ] && msg="$msg ($extra)"
+      ;;
+    disabled)
+      msg="ℹ️ ops-watcher disabled (.ops-watcher.disabled touched, queue paused)"
+      ;;
+    resumed)
+      msg="ℹ️ ops-watcher resumed (.ops-watcher.disabled removed, queue active)"
+      ;;
+    *)
+      return 0
+      ;;
+  esac
+
+  if send_telegram_raw "$msg"; then
+    write_event "info" "telegram sent" "" \
+      "$(jq -n --arg k "$kind" '{kind: "lifecycle", event: $k}')"
+  else
+    write_event "error" "telegram send failed" "" \
+      "$(jq -n --arg k "$kind" '{kind: "lifecycle", event: $k}')"
+  fi
+}
+
+# 边沿检测：调用前后比对 .ops-watcher.disabled 是否切换
+# 只在切换瞬间发 disabled / resumed 通知
+check_lifecycle_edge() {
+  local current
+  if [ -f "$DISABLED_FLAG" ]; then
+    current="disabled"
+  else
+    current="enabled"
+  fi
+
+  local prev=""
+  [ -f "$LIFECYCLE_STATE_FILE" ] && prev=$(cat "$LIFECYCLE_STATE_FILE" 2>/dev/null || echo "")
+
+  if [ "$current" != "$prev" ]; then
+    case "$current" in
+      disabled) notify_lifecycle disabled ;;
+      enabled)
+        # 仅当 prev 是 disabled 时才算 resumed（首次启动 prev="" 不发 resumed）
+        [ "$prev" = "disabled" ] && notify_lifecycle resumed
+        ;;
+    esac
+    mkdir -p "$(dirname "$LIFECYCLE_STATE_FILE")"
+    echo "$current" > "$LIFECYCLE_STATE_FILE"
   fi
 }
 
@@ -941,6 +1172,20 @@ classify_risk() {
 
 # ===== 处理一个 request =====
 
+# 终结一个 proposal 的处理：write_result + consume_request + archive_proposal + notify
+# 单一出口确保 notify_proposal 的覆盖与 write_result 严格一致；任何新增状态都在这里加
+finalize_proposal() {
+  local id="$1" status="$2" risk="$3" reason="$4"
+  local details="${5:-{\}}"
+  local preflight="${6:-{\}}"
+  write_result "$id" "$status" "$risk" "$reason" "$details" "$preflight"
+  consume_request "$id"
+  archive_proposal "$id"
+  # B.2: should_notify_proposal 内部按 status × risk matrix 过滤；
+  # 推送条件不满足时静默返回，不影响主流程
+  notify_proposal "$id" "$status" "$risk" || true
+}
+
 process_request() {
   local id="$1"
 
@@ -949,9 +1194,7 @@ process_request() {
   # 1. disabled
   if check_disabled; then
     write_event "info" "watcher disabled, skipping" "$id" '{}'
-    write_result "$id" "disabled" "UNKNOWN" "watcher is disabled (.ops-watcher.disabled exists)" '{}' '{}'
-    consume_request "$id"
-    archive_proposal "$id"
+    finalize_proposal "$id" "disabled" "UNKNOWN" "watcher is disabled (.ops-watcher.disabled exists)"
     return
   fi
 
@@ -959,9 +1202,7 @@ process_request() {
   local reason=""
   if ! check_manifest_schema "$id" reason; then
     write_event "error" "manifest schema rejected: $reason" "$id" '{}'
-    write_result "$id" "rejected" "UNKNOWN" "$reason" '{}' '{}'
-    consume_request "$id"
-    archive_proposal "$id"
+    finalize_proposal "$id" "rejected" "UNKNOWN" "$reason"
     return
   fi
 
@@ -969,9 +1210,7 @@ process_request() {
   reason=""
   if ! check_block_paths "$id" reason; then
     write_event "error" "BLOCK path detected: $reason" "$id" '{}'
-    write_result "$id" "blocked" "BLOCK" "$reason" '{}' '{}'
-    consume_request "$id"
-    archive_proposal "$id"
+    finalize_proposal "$id" "blocked" "BLOCK" "$reason"
     return
   fi
 
@@ -979,9 +1218,7 @@ process_request() {
   reason=""
   if ! check_candidate_files "$id" reason; then
     write_event "error" "candidate file check rejected: $reason" "$id" '{}'
-    write_result "$id" "rejected" "UNKNOWN" "$reason" '{}' '{}'
-    consume_request "$id"
-    archive_proposal "$id"
+    finalize_proposal "$id" "rejected" "UNKNOWN" "$reason"
     return
   fi
 
@@ -989,9 +1226,7 @@ process_request() {
   reason=""
   if ! check_stale "$id" reason; then
     write_event "warning" "stale: $reason" "$id" '{}'
-    write_result "$id" "stale" "UNKNOWN" "$reason" '{}' '{}'
-    consume_request "$id"
-    archive_proposal "$id"
+    finalize_proposal "$id" "stale" "UNKNOWN" "$reason"
     return
   fi
 
@@ -1002,9 +1237,7 @@ process_request() {
   check_conflict "$id" reason superseded_id || conflict_rc=$?
   if [ "$conflict_rc" != "0" ]; then
     write_event "warning" "conflict: $reason" "$id" '{}'
-    write_result "$id" "conflict" "UNKNOWN" "$reason" '{}' '{}'
-    consume_request "$id"
-    archive_proposal "$id"
+    finalize_proposal "$id" "conflict" "UNKNOWN" "$reason"
     return
   fi
   if [ -n "$superseded_id" ]; then
@@ -1028,15 +1261,14 @@ process_request() {
     # 旧 proposal 加一个 superseded summary
     printf '%s | superseded | UNKNOWN | superseded by %s | -\n' "$superseded_id" "$id" \
       > "$RESULTS_DIR/${superseded_id}.superseded.UNKNOWN.summary"
+    # B.2: superseded 静默不通知（依赖 Phase 4 apply 二次校验 effective_status 兜底）
   fi
 
   # 6. global rules
   reason=""
   if ! check_global_rules "$id" reason; then
     write_event "error" "global rule violation: $reason" "$id" '{}'
-    write_result "$id" "blocked" "BLOCK" "$reason" '{}' '{}'
-    consume_request "$id"
-    archive_proposal "$id"
+    finalize_proposal "$id" "blocked" "BLOCK" "$reason"
     return
   fi
 
@@ -1044,9 +1276,7 @@ process_request() {
   reason=""
   if ! check_baseline_invariants "$id" reason; then
     write_event "error" "baseline invariant violation: $reason" "$id" '{}'
-    write_result "$id" "blocked" "BLOCK" "$reason" '{}' '{}'
-    consume_request "$id"
-    archive_proposal "$id"
+    finalize_proposal "$id" "blocked" "BLOCK" "$reason"
     return
   fi
 
@@ -1054,9 +1284,7 @@ process_request() {
   reason=""
   if ! check_manifest_whitelists "$id" reason; then
     write_event "error" "manifest whitelist rejected: $reason" "$id" '{}'
-    write_result "$id" "rejected" "UNKNOWN" "$reason" '{}' '{}'
-    consume_request "$id"
-    archive_proposal "$id"
+    finalize_proposal "$id" "rejected" "UNKNOWN" "$reason"
     return
   fi
 
@@ -1067,9 +1295,7 @@ process_request() {
   isolated_preflight "$id" reason preflight_json || preflight_rc=$?
   if [ "$preflight_rc" != "0" ]; then
     write_event "error" "preflight failed: $reason" "$id" "$preflight_json"
-    write_result "$id" "preflight_failed" "UNKNOWN" "$reason" '{}' "$preflight_json"
-    consume_request "$id"
-    archive_proposal "$id"
+    finalize_proposal "$id" "preflight_failed" "UNKNOWN" "$reason" '{}' "$preflight_json"
     return
   fi
 
@@ -1079,9 +1305,7 @@ process_request() {
 
   # 10. accepted
   write_event "info" "accepted_for_review" "$id" "$(jq -n --arg r "$risk" '{risk_level: $r}')"
-  write_result "$id" "accepted_for_review" "$risk" "passed all static checks" '{}' "$preflight_json"
-  consume_request "$id"
-  archive_proposal "$id"
+  finalize_proposal "$id" "accepted_for_review" "$risk" "passed all static checks" '{}' "$preflight_json"
 }
 
 # ===== 主循环 / CLI =====
@@ -1094,7 +1318,20 @@ main_loop() {
   ensure_dirs
   load_baseline
   check_snapshot_dir
+  load_telegram_env
   write_event "info" "watcher started" "" "$(jq -n --arg pd "$PROJECT_DIR" --arg sd "$SNAPSHOT_DIR" '{project_dir: $pd, snapshot_dir: $sd}')"
+
+  # B.2: 塔台可见性——started 不进幂等表，每次主循环启动都发
+  local snap_id
+  snap_id=$(cat "$SNAPSHOT_DIR/.snapshot-id" 2>/dev/null || echo "unknown")
+  notify_lifecycle "started" "snapshot=${snap_id}"
+
+  # B.2: SIGTERM/SIGINT 时通知 stopped；幂等表/lifecycle-state 都不动
+  # （主循环可能被 launchd / Ctrl-C / kill 多种方式终止）
+  trap 'notify_lifecycle "stopped" "graceful shutdown"; exit 0' INT TERM
+
+  # 首次启动写入 lifecycle 初态（避免下一轮把 enabled 当成"resumed"）
+  check_lifecycle_edge
 
   echo "[ops-watcher] PROJECT_DIR=$PROJECT_DIR"
   echo "[ops-watcher] SNAPSHOT_DIR=$SNAPSHOT_DIR"
@@ -1104,11 +1341,13 @@ main_loop() {
   if command -v fswatch >/dev/null 2>&1; then
     echo "[ops-watcher] using fswatch"
     # Process any pending first
+    check_lifecycle_edge
     for id in $(list_pending_requests); do
       process_request "$id" || true
     done
     fswatch -0 "$REQUESTS_DIR" | while IFS= read -r -d '' _; do
       sleep 0.2  # debounce
+      check_lifecycle_edge
       for id in $(list_pending_requests); do
         process_request "$id" || true
       done
@@ -1116,6 +1355,7 @@ main_loop() {
   else
     echo "[ops-watcher] fswatch missing, falling back to polling every ${POLL_INTERVAL}s"
     while true; do
+      check_lifecycle_edge
       for id in $(list_pending_requests); do
         process_request "$id" || true
       done
@@ -1133,12 +1373,14 @@ case "${1:-}" in
     ensure_dirs
     load_baseline
     check_snapshot_dir
+    load_telegram_env  # B.2: 单次模式仍发 proposal 通知；不发 started/stopped
     process_request "$1"
     ;;
   --process-all)
     ensure_dirs
     load_baseline
     check_snapshot_dir
+    load_telegram_env  # B.2: 同上
     for id in $(list_pending_requests); do
       process_request "$id" || true
     done

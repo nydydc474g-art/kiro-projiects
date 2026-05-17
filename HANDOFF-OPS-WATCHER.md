@@ -464,3 +464,44 @@ watcher 视野与现实完全一致。
 - B.2 Telegram 单向摘要通知
 - B.3 集成测试 SOP
 - B.4 launchd plist 开机自启
+
+
+
+
+---
+
+## Checkpoint：B.2 Telegram 单向摘要通知（2026-05-17）
+
+### 已交付（沙箱完成；待生产实测）
+
+| 文件 | 改动 |
+|------|------|
+| `scripts/ops/ops-watcher.sh` | 新增 7 个函数：`load_telegram_env / should_notify_proposal / format_proposal_message / send_telegram_raw / notify_proposal / notify_lifecycle / check_lifecycle_edge`；新增统一终结点 `finalize_proposal`（write_result + consume + archive + notify 4 件套合并）；main_loop 加 started/stopped/edge 钩子；--once / --process-all 仅 load env 不发 lifecycle |
+| `scripts/ops/.ops-watcher.env.example` | 新增模板（chmod 600 + 仅含 TELEGRAM_BOT_TOKEN/CHAT_ID） |
+| `OPS-WATCHER-DESIGN.md` | 追加 B.2 checkpoint：status × risk matrix + 三条实现约束 + Phase 4 兜底声明 |
+
+### 通知策略（status × risk matrix）
+
+推送：accepted_for_review × {LOW,MEDIUM,HIGH}; blocked × BLOCK
+静默：conflict / stale / rejected / preflight_failed / disabled / superseded
+
+### 三条 hardening 约束（已落地）
+
+1. `.notified.txt` 只存 proposal 三元组 `<id>:<status>:<risk>`；lifecycle 事件不写
+2. disabled/resumed 边沿检测，state file `ops_spool/.lifecycle-state`
+3. `.notified.txt` 只在 sendMessage HTTP 200 之后追加；失败只记 events.jsonl ERROR
+
+### Superseded 静默 → Phase 4 兜底
+
+apply-proposal.sh 必须在 apply 前重读 `get_effective_status`，拒绝非 accepted_for_review 的目标。已写入 OPS-WATCHER-DESIGN.md，Phase 4 实施时绕不过去。
+
+### 还没测的
+
+- 真 Telegram 推送（生产机 chmod 600 + 真 token + 一次 LOW proposal）
+- lifecycle 4 档：started 上线、touch disabled flag → 收到 disabled、rm flag → 收到 resumed、Ctrl-C → 收到 stopped
+- 网络故障下 .notified.txt 不被污染（断网模拟）
+
+### B.3 / B.4 待办（不变）
+
+- B.3 集成测试 SOP（agent 容器内真实跑 ops-propose 全链路 + Telegram 实测）
+- B.4 launchd plist 开机自启
