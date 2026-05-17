@@ -1,0 +1,6 @@
+port: 8317
+secret-key: sk-cliproxy
+auth-dir: /root/.cli-proxy-api
+
+api-keys:
+  - sk-cliproxy-client
