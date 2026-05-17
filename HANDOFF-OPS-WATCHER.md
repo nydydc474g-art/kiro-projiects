@@ -1,0 +1,231 @@
+# Ops Watcher 交接文档（HANDOFF）
+
+> 状态：Step A + A.1 完成，Step B 待启动。
+> 分支：`ops-watcher`
+> 仓库：https://github.com/nydydc474g-art/kiro-projiects/tree/ops-watcher
+
+---
+
+## 一句话现状
+
+Watcher 静态判定内核已生产实测通过：proposal 提交 → 14 项静态检查 → 写权威结果 + 单行路标 + 审计流。**还没接 Telegram，还没改 compose，还没让 agent 容器真正能用 ops-propose。**
+
+---
+
+## 给下个窗口的第一句话
+
+> "继续 ops-watcher 项目的 Step B。读 `OPS-WATCHER-DESIGN.md` 与 `HANDOFF-OPS-WATCHER.md`，然后实施 Step B。"
+
+下个窗口拿到这两个文档就能完整接上。
+
+---
+
+## 已落地（生产宿主机实测过）
+
+### 文件
+
+```
+仓库根/
+  OPS-WATCHER-DESIGN.md           ← 完整设计文档（v1→v2 演进 + 各 Phase checkpoint）
+  HANDOFF-OPS-WATCHER.md          ← 本文档
+  scripts/ops/
+    init-snapshot.sh              ← 宿主机刷 snapshot（versions/current 结构）
+    ops-helper.sh                 ← agent 容器内 ops-propose 命令
+    ops-baseline.json             ← watcher 唯一安全合同
+    ops-watcher.sh                ← 14 个检查模块 + 主循环
+    README.md                     ← 状态流图 + 命名规则 + 验证步骤
+```
+
+### 实测确认
+
+| 项 | 状态 | 证据 |
+|----|------|------|
+| `init-snapshot.sh` 跑通 | ✅ | 生产宿主机：`versions/20260517T065529Z`, hash `570f163b...` |
+| `ops-helper.sh` 全流程 | ✅ | 16 项自动化测试 + 生产实测：proposal 创建/校验/提交 |
+| `ops-watcher.sh` 静态判定 | ✅ | 16 类自动化测试全过（19 PASS / 0 FAIL） |
+| baseline invariant 真比对 | ✅ | 生产实测：删 read_only → "agent.read_only=false, baseline requires true" → blocked / BLOCK |
+
+### 状态流（不可变）
+
+```
+request detected
+  ↓
+disabled?              → disabled
+manifest jq parse fail → rejected (malformed)
+schema fields missing  → rejected
+BLOCK path?            → blocked
+candidate files 重验    → rejected   (A.1-2: exists/symlink/regular/sha256/no-op)
+stale (id|hash)?       → stale
+conflict (path overlap)→ conflict (除非显式 supersedes 合法)
+global rules           → blocked    (privileged/docker.sock/cap_add/ports/host net/ns)
+baseline invariants    → blocked    (A.1-1: agent read_only/cap_drop/security_opt/user/必需挂载)
+manifest whitelists    → rejected   (path regex / service / verification 名格式)
+isolated preflight     → preflight_failed (compose config + hadolint)
+risk classify          → LOW / MEDIUM / HIGH
+accepted_for_review
+```
+
+### 状态枚举
+
+```
+accepted_for_review  / rejected      / blocked       / stale
+conflict             / superseded    / preflight_failed / disabled
+```
+
+`status` 与 `risk_level` 正交（HIGH 也能 stale，LOW 也能 blocked）。
+
+---
+
+## Step B 范围（下个窗口要做的）
+
+### 必做
+
+1. **compose 修改** — agent 服务新增挂载，让容器内 helper 能真正读写：
+   ```yaml
+   - ./agent_workspace/.snapshot:/app/workspace/.snapshot:ro
+   ```
+   ops-proposals / ops-requests / ops-results 已经在 `agent_workspace/` 内，无需新增挂载。
+
+2. **Dockerfile 修改** — agent 镜像 COPY ops-helper.sh：
+   ```dockerfile
+   COPY scripts/ops/ops-helper.sh /usr/local/bin/ops-propose
+   RUN chmod +x /usr/local/bin/ops-propose
+   ```
+
+3. **Telegram 通知模块** — watcher 收到 result 后推送：
+   - 4 档样式（LOW / MEDIUM / HIGH / BLOCKED + apply 结果，apply 这部分先留空 placeholder）
+   - watcher 启动/停止
+   - 决策：直接 curl Telegram API（已在 .env 有 token）还是走现有 collector？
+     - **建议**：watcher 直接 curl，避免引入对 collector 的依赖循环（watcher 是宿主机进程，collector 是容器内进程）
+
+4. **launchd plist** — watcher 开机自启 + 进程崩溃自动重启
+   - 文件位置：`~/Library/LaunchAgents/com.caimin.ops-watcher.plist`
+   - 用 `launchctl load` 加载
+
+5. **集成测试** — agent 容器内真实跑：
+   ```bash
+   docker exec -it agent ops-propose new "test"
+   # ... add / set-* / submit
+   # 在另一终端看 watcher 处理
+   # Telegram 收到通知
+   ```
+
+### 不做（留给后续 Phase）
+
+- ❌ apply-proposal.sh（Phase 4）
+- ❌ verifications/ 命名检查项库（Phase 5）
+- ❌ 真实 docker compose up（Phase 4）
+- ❌ git tag 快照 + rollback（Phase 4）
+
+---
+
+## 关键决策与不变量（不要破坏）
+
+### 安全不变量
+
+1. **agent 内无真实 API key**（容器内继续用 dummy token）
+2. **agent 唯一可写宿主机路径 = `agent_workspace/`**（`.snapshot/` 是 :ro 挂载）
+3. **审计不可篡改**（audit_spool 对 agent :ro，guard.sh 对 agent 不可写）
+4. **零端口 publish 到宿主机**
+5. **container 安全字段不被放权**（read_only/cap_drop/no-new-privileges）
+6. **watcher 不主动 docker compose up**（Step B 仅做静态判定 + 通知）
+
+### 协议不变量
+
+1. **`ops-results/<id>.json` 一旦写入即只读**（后续状态走 `<id>.<event>.json` sibling）
+2. **summary 是派生视图**（冲突时以 `<id>.json` 为准）
+3. **status 与 risk_level 正交**（不要合并）
+4. **PROPOSAL_PATH_ALLOWED 是具体文件白名单**（不是目录通配）
+5. **claude_config/ 在 SNAPSHOT_INCLUDED 但不在 PROPOSAL_PATH_ALLOWED**（只读知情，不可提案改动）
+6. **watcher 不信任 helper**（Step A.1 已落地：watcher 重跑所有 helper 校验）
+
+### 工程不变量
+
+1. **bash 3.2 兼容**（不用 `set -u`，grep 零匹配 `|| true`）
+2. **jq -n 生成 JSON**（不拼字符串）
+3. **mktemp + mv 原子写**（trap 兜底清理）
+4. **current symlink 用 `ln -sfn`**（不要 `mv current.new current`，会进 symlink 指向的目录）
+
+---
+
+## 用户环境（下个窗口需要知道）
+
+```
+宿主机：macOS Mac mini (Docker Desktop 29.4.0)
+Shell：/bin/bash 3.2（默认）
+项目路径：/Users/caimin/ai_sandbox
+GitHub：nydydc474g-art/kiro-projiects（public 仓库）
+分支：ops-watcher
+.env：chmod 600，含真实 API key 和 Telegram token
+防火墙：已启用
+SSH + Tailscale：已启用，iPhone 远程
+```
+
+### 用户偏好
+
+- 先问环境，先看完文件再给意见
+- 不要枚举式防御
+- 提交前在生产宿主机实测
+- handoff / checkpoint 用日志方式追加，不要重写
+- macOS bash 3.2 + `set -eo pipefail` 下，`grep` 零匹配 = exit 1 = 经典坑
+
+---
+
+## Step B 启动 SOP（下个窗口给 Kiro）
+
+```
+1. 看 OPS-WATCHER-DESIGN.md 最后一段（Phase 2 拆分 → Step B 范围）
+2. 看 HANDOFF-OPS-WATCHER.md 全文
+3. 看 scripts/ops/README.md（了解状态流和命名）
+4. ls 看仓库现状，确认 5 个文件都在
+5. 与用户确认 Step B 拆分顺序：
+   建议：
+     B.1 compose 挂载 + Dockerfile + 容器内验证 helper 能用
+     B.2 Telegram 通知模块（先 watcher 启动 + accepted_for_review 通知）
+     B.3 完整 4 档通知 + 集成测试
+     B.4 launchd plist + 开机自启
+6. 不要先动 launchd（最后再做，避免开发期被自动重启干扰）
+7. Step B 完成后：写 STEP-B-COMPLETE.md（追加，不重写）
+```
+
+---
+
+## 测试套件（保留在 sandbox 仓库历史，不在生产）
+
+`.test-step-a1.sh`（已删除）覆盖 16 类场景：
+- T1 valid LOW
+- T2 claude_config blocked
+- T3-T4 compose privileged/ports
+- T5 stale
+- T6 conflict
+- T7 disabled
+- T8 hadolint missing
+- T10 malformed JSON
+- T11 supersedes
+- T12-T14 baseline invariants（删 read_only / cap_drop / audit_spool）
+- T15-T18 candidate 重验（缺失/sha漂移/symlink/目录）
+
+下个窗口如要扩展测试，模式参考 commit `b70a987` 之前的 `.test-step-a1.sh`（GitHub 历史可查）。
+
+---
+
+## 紧急联系
+
+如发现生产环境异常：
+
+```bash
+# 立即停 watcher
+touch ~/ai_sandbox/.ops-watcher.disabled
+
+# 看 watcher 干了什么
+tail ~/ai_sandbox/ops_spool/events.jsonl | jq -c .
+
+# 看最近的 result
+ls -lt ~/ai_sandbox/agent_workspace/ops-results/*.summary | head
+```
+
+watcher 自身不接触 docker（Step A），最坏后果只是写错误的 result 文件——可直接 rm 重来。
+
+---
+
+完。
