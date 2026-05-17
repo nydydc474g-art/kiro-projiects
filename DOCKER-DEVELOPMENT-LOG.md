@@ -2,7 +2,7 @@
 
 > 从空白目录到 6 服务 CC-Only 生产就绪，完整记录每个关键节点与决策。
 
-## 当前状态摘要（2026-05-16）
+## 当前状态摘要（2026-05-17）
 
 | 项目 | 状态 |
 |------|------|
@@ -677,3 +677,45 @@ squid_parse_ok
 ```
 
 教训：**配置存在、设计正确、运行可解析，是三件不同的事。** 对代理、网关、ACL 这类基础设施，E2E 不能只看文件内容和外部表现，中间还必须验证组件本身能成功加载配置。
+
+
+### 第二层安全审计：宿主机暴露面 + Docker Daemon（2026-05-17）
+
+第一层（agent 容器内逃逸）全部通过后，启动第二层安全审计——关注点从"容器内能做什么"转向"宿主机对外暴露了什么"。
+
+新增 `host-audit.sh`，覆盖 8 个威胁面：
+
+| # | 威胁面 | 检查项 |
+|---|--------|--------|
+| 1 | Docker socket 暴露 | compose 未挂载 docker.sock、宿主机 socket 权限、无 privileged 容器 |
+| 2 | 端口暴露 | compose 零 ports 声明、运行时无 0.0.0.0 绑定 |
+| 3 | 宿主机文件权限 | agent_workspace / audit_spool / claude_config 的 owner + mode |
+| 4 | Docker daemon 配置 | 版本、userns-remap、seccomp、AppArmor、Docker Desktop VM 隔离、no-new-privileges |
+| 5 | 宿主机网络 | 非 localhost 监听端口、Tailscale 状态、SSH 服务、macOS 防火墙 |
+| 6 | 备份与恢复 | agent_workspace git 仓库、定期 cron 备份、Time Machine 覆盖 |
+| 7 | .env 保护 | 文件权限、git 跟踪状态、.gitignore 规则、明文 key 检测 |
+| 8 | Docker 镜像供应链 | floating tag 检测、Dockerfile FROM digest 锁定、漏洞扫描工具可用性 |
+
+设计原则：
+- 在宿主机直接运行（不走容器），因为审计对象就是宿主机本身
+- `set -eo pipefail`（不用 `set -u`，bash 3.2 兼容）
+- PASS / WARN / FAIL 三级输出，汇总统计
+- FAIL > 0 时 exit 1，方便作为 CI/定期检查卡点
+
+当前评估（基于 compose 分析，未在宿主机实跑）：
+
+| 威胁面 | 预期结果 |
+|--------|----------|
+| Docker socket | ✅ 未挂载，macOS Docker Desktop VM 隔离 |
+| 端口暴露 | ✅ 零 ports publish |
+| 文件权限 | ⚠️ 取决于宿主机实际 umask，需实测 |
+| Docker daemon | ⚠️ userns-remap/AppArmor 不适用于 macOS，依赖 VM 隔离 |
+| 宿主机网络 | ⚠️ Tailscale/SSH 状态需实测 |
+| 备份 | ⚠️ 无定期 cron，依赖 git + Time Machine |
+| .env | ⚠️ 权限需实测，明文 key 存在（macOS 单用户可接受） |
+| 镜像供应链 | ⚠️ 3 个镜像用 floating tag（latest/main-latest） |
+
+下一步：
+- 在宿主机实跑 `host-audit.sh`，确认实际结果
+- 根据 WARN 项决定是否加固（如镜像锁定 digest、.env chmod 600）
+- 考虑将关键检查整合到 `healthcheck.sh` 定期执行
