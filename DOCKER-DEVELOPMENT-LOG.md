@@ -716,6 +716,41 @@ squid_parse_ok
 | 镜像供应链 | ⚠️ 3 个镜像用 floating tag（latest/main-latest） |
 
 下一步：
-- 在宿主机实跑 `host-audit.sh`，确认实际结果
-- 根据 WARN 项决定是否加固（如镜像锁定 digest、.env chmod 600）
+- ~~在宿主机实跑 `host-audit.sh`，确认实际结果~~ ✅
+- ~~根据 WARN 项决定是否加固~~ ✅
 - 考虑将关键检查整合到 `healthcheck.sh` 定期执行
+
+### 第二层审计实测结果（2026-05-17）
+
+宿主机实跑 `host-audit.sh`，首次运行即暴露一个脚本 bug：
+
+**Bug**: `grep -E '^\s+ports:' "$COMPOSE_FILE" | wc -l` 在 `set -eo pipefail` 下，grep 匹配 0 行时返回 exit 1，pipefail 传播导致脚本中断在第 2 节。
+**修复**: 改为 `grep -cE '^\s+ports:' "$COMPOSE_FILE" || true`。
+**教训**: bash 3.2 + pipefail + grep 零匹配 = exit 1，这是 macOS 默认 shell 的经典陷阱。所有 grep 取计数的场景必须 `|| true` 兜底。
+
+修复后完整跑通，结果：
+
+```
+PASS: 18 | WARN: 21 | FAIL: 0
+```
+
+已执行加固：
+
+| 加固项 | 命令 |
+|--------|------|
+| .env 权限收紧 | `chmod 600 ~/ai_sandbox/.env` |
+| macOS 防火墙开启 | `socketfilterfw --setglobalstate on` |
+| ai_sandbox 纳入 git | `git init` + `.gitignore` 排除 agent_workspace/audit_spool/.env |
+
+已确认接受的 WARN（21 项）：
+
+| 类别 | 数量 | 理由 |
+|------|------|------|
+| macOS 平台限制（userns/AppArmor/VM 检测误判） | 3 | Docker Desktop VM 隔离兜底，无法改变 |
+| 系统服务端口（AirDrop/AirPlay/Tailscale） | 3 | 有意使用，非项目暴露 |
+| Tailscale Running | 1 | iPhone → Mac mini 远程访问链路，有意保留 |
+| 明文 API Key | 1 | chmod 600 + 单用户 macOS 已足够 |
+| 无定期备份 cron | 1 | git + Time Machine 兜底，优先级低 |
+| 镜像未锁 digest | 13 | 官方镜像 + 版本 tag，本地开发 ROI 低 |
+
+**结论：第二层宿主机暴露面审计通过。**
