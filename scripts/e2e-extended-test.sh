@@ -15,7 +15,7 @@
 # 用法：cd /Users/caimin/ai_sandbox && ./scripts/e2e-extended-test.sh
 # 依赖：docker compose 环境已启动，6 服务 Up
 # ============================================================
-set -euo pipefail
+set -eo pipefail
 
 PASS=0
 FAIL=0
