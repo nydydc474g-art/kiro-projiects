@@ -119,6 +119,29 @@ accepted_for_review
 | HIGH | docker-compose.yml |
 | BLOCK | claude_config/* / .env / audit_spool/* / cliproxyapi/auths/* |
 
+### effective_status：当前生命周期投影（不是 .json.status）
+
+`ops-results/<id>.json.status` 是 proposal 的**初始裁决**，写入即只读。但 proposal 实际状态会通过 sibling 文件继续演进——所以**watcher 任何决策都不读 `.json.status`，读 `get_effective_status(id)`**。
+
+| 来源 | 含义 |
+|------|------|
+| `<id>.json.status` | 初始裁决（不可变） |
+| `get_effective_status(id)` | 当前生命周期投影（动态） |
+
+读取规则（在 ops-watcher.sh 中实现）：
+
+1. proposal 目录不存在 → `""`
+2. 没 `<id>.json` → `pending`（已 submit 等 watcher / 还没 submit 的草稿）
+3. 任意 lifecycle sibling 文件存在 → 取 sibling 状态（一期：`.superseded.json` → `superseded`；Phase 4：`.applied.json` / `.rolled_back.json`）
+4. 否则 → `.json.status`
+
+watcher 内部决策的两条具体规则：
+
+- 占位检测：`effective_status ∈ {accepted_for_review, pending}` 视为占位
+- supersedes target：必须 `effective_status == accepted_for_review`
+
+详见 `OPS-WATCHER-DESIGN.md` 的 effective_status 段——这是 B.1 hotfix v2 引入的抽象，**几个月后最容易被误读**的就是这一层。下游脚本（apply-proposal.sh / 任何 lifecycle 检查）必须沿用同一函数，不要绕开。
+
 ### Result 文件命名
 
 ```
