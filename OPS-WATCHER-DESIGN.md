@@ -1117,3 +1117,83 @@ hotfix 已写但还没生产实证。
 - B.2 hotfix cutover SOP（拉 hotfix 分支代码 + sed 改 env 变量名 + 重启）
 - B.3 完整生产实测 SOP（lifecycle 4 档 / proposal 4 档 / heartbeat / 失败路径）
 - B.4 launchd 自启
+
+
+
+
+---
+
+## Checkpoint：B.2 hotfix 生产实证通过 + line 573 修复（2026-05-17）
+
+> 替代上一条"沙箱完成；生产仍未实测"checkpoint 的认知状态。
+> 完整生产证据链 + 排查叙事见 `HANDOFF-OPS-WATCHER.md` 同名 checkpoint。
+
+### 设计层面新增 / 强化的两条原则
+
+#### 1. 工具语义不对齐时换工具，不要在调用上叠 fallback
+
+B.2 hotfix line 573 原写法：
+
+```bash
+queue=$(ls "$REQUESTS_DIR"/*.json 2>/dev/null | wc -l | tr -d ' ')
+```
+
+空目录时 `ls *.json` exit 1 → pipefail → set -e 杀脚本。
+
+第一直觉的"加 `|| echo "0"` 兜底" 看起来对，**实际上正确性更低**——空匹配时 `wc -l` 已经输出一行 `0`，再追加 fallback `0` → `queue=$'0\n0'`，下游 printf 渲染成两行 0、jq `--arg` 拿到带换行字符串。"成功路径输出污染"是 fallback 链的隐性 bug。
+
+正解换工具：
+
+```bash
+queue=$(find "$REQUESTS_DIR" -maxdepth 1 -type f -name '*.json' -print 2>/dev/null | wc -l | tr -d ' ')
+```
+
+`find` 的契约和 `ls` 不同：找不到匹配**安静返回 exit 0 + stdout 空**。wc 拿空输入输出 0，整条管道天然干净，不需要 fallback。
+
+**原则**：当一个工具的 exit code 契约和你的需求方向相反时，换工具比包 fallback 稳。fallback 链是"修一个引入两个"的常见来源——既要兜住失败，又不能污染成功。
+
+副作用是诊断能力变差一点（find 把"目录失败"和"目录空"合并）。这是单独的问题：用启动自检 `[ -d "$REQUESTS_DIR" ] || die ...` 解决，不该塞到一行赋值里做。一行职责单一原则。
+
+#### 2. set -eo pipefail 下管道首端的 exit code 是隐性杀手
+
+learnings 里早就记过 grep 零匹配 = exit 1 的坑（macOS bash 3.2 经典）。这次同一模式在 ls 上又咬一次：
+
+| 工具 | 零匹配 exit code | pipefail 影响 |
+|---|---|---|
+| `grep` | 1 | 杀脚本（已知，learnings 有记） |
+| `ls *.json` | 1 (no match) | 杀脚本（hotfix 实测） |
+| `find -name '*.json'` | 0 (空 stdout) | 安全 |
+| `wc -l` | 0 (输出 0) | 安全 |
+
+review 任何 `set -eo pipefail` + 管道写法时，**首端命令的 zero-match exit code 必须显式核实**。grep 那条已经在 learnings；ls 这条今天补进去。
+
+### B.2 hotfix 三件事生产实证证据
+
+| 件 | 证据 |
+|---|---|
+| `TELEGRAM_PROXY_URL` 专用代理变量 | events.jsonl `kind=lifecycle event=started http_code=200`（curl 走 `--proxy` 显式参数，全局 HTTPS_PROXY 已 unset） |
+| `LAST_TELEGRAM_HTTP_CODE` 暴露 | 成功路径每条 telegram event 带 `http_code: "200"`；失败路径 12:11:03 一条 `heartbeat send failed http_code: "000"` 完美演示连接失败的诊断价值 |
+| `check_heartbeat` 端到端心跳 | `OPS_HEARTBEAT_INTERVAL=60` 下连续 5+ tick 稳定发出；失败 tick 后下一次仍正常发出，主流程不阻断 |
+
+### 设计意图的验证
+
+B.2 hotfix checkpoint 当时写的"端到端心跳是 watcher + 代理 + telegram 三件事都活着的端到端证明"在 12:11:03 这个真实失败 tick 上一次性验证：
+
+- `heartbeat send failed http_code:000` 出现 → 用户立刻知道代理那一环出问题了
+- 12:11:39 disabled 通知重新发出 → 代理恢复后 watcher 自愈
+- 整段过程 watcher 进程不重启、events.jsonl 持续 append
+
+这正是设计当时担心的"守序的失败 = 沉默的失败"被打破——失败被显式记录，下一次 tick 自动恢复。如果没有 hotfix 的 http_code 字段，这条 error 在 events.jsonl 里只会显示 `telegram send failed` 6 个字，无法区分代理失败 / token 失败 / chat_id 失败。hotfix 的诊断改造在生产 tick 上证明了价值。
+
+### Lifecycle 4 档实证状态（3/4）
+
+started ✅ disabled ✅ resumed ✅ / stopped 留到 B.3 末尾测（Ctrl-C 是 stopped 的天然触发）
+
+`check_lifecycle_edge` 的"首次启动 prev='' 不发 resumed" 边界条件也间接实证：started 之后没有连带的 resumed event，符合设计。
+
+### B.3 / B.4 待办
+
+详见 `HANDOFF-OPS-WATCHER.md`。简言：
+- B.3 proposal 4 档（status × risk matrix）即将做，LOW 档将顺手 supersede 084006 这条 B.1 时代留下的烟雾弹 proposal
+- B.3 失败路径主动测试（断网 → 验证 `.notified.txt` 不被污染）
+- B.4 launchd 自启，加 SR 启动顺序约束 + heartbeat 作为侧面信号

@@ -11,15 +11,18 @@
 > **本文件追加式更新，前文不重写。**
 > 如果你是新窗口的 agent，先读这一段定位进度，再按指引跳到末段。
 
-- 当前最新分支：`ops-watcher-step-b-hotfix`（B.2 hotfix 沙箱完成，**生产未实测**）
-- 生产宿主机当前实际跑的：`ops-watcher-step-b` 上的 5ce4c9b（B.2 沙箱稿）
-- env 当前形态：`HTTPS_PROXY=http://127.0.0.1:1082`（端口已新，变量名仍旧）
-- 下窗口最先要做的事：按本文件最末 **「下窗口必跑：Cutover SOP」** 章节的步骤
-  把 hotfix 搬到生产 + 实测 started，再做 B.3
-- 真实进度详情：见末段 `Checkpoint：B.2 hotfix 沙箱完成；生产仍未实测（2026-05-17）`
+- 当前最新分支：`ops-watcher-step-b-hotfix`（含 commit `3c0a60c` line 573 修复）
+- 生产宿主机当前实际跑的：**`ops-watcher-step-b-hotfix` 头部代码** + watcher 在前台 polling 模式跑着
+- env 当前形态：`TELEGRAM_PROXY_URL=http://127.0.0.1:1082`（cutover 已完成）
+- B.2 hotfix 三件事 + line 573 修复**全部生产实证通过**（详见末段 checkpoint）
+- Lifecycle 4 档：started ✅ disabled ✅ resumed ✅ / stopped 留到 B.3 末尾
+- B.3 proposal 4 档：**即将开始**
+- 下窗口（如果是新会话接手 B.3 之后阶段）的入口：跳到末段最新一条 checkpoint
+  `Checkpoint：B.2 hotfix 生产实证 + line 573 修复（2026-05-17）`
 
-跳转：[末段 Cutover SOP](#下窗口必跑cutover-sop拉-hotfix--改-env--重启) ·
-[B.3 完整测试清单](#b3-完整测试清单下窗口要做)
+历史快照（仅供查阅，不要照做）：
+- 末段 `下窗口必跑：Cutover SOP` —— cutover 已完成，**SOP 不再需要执行**
+- 末段 `Checkpoint：B.2 hotfix 沙箱完成；生产仍未实测` —— 已被新 checkpoint 覆盖
 
 ---
 
@@ -837,3 +840,136 @@ lifecycle 4 档边沿 → proposal 4 档（status × risk matrix）→ heartbeat
 
 B.3 全部通过后，再开 B.4（launchd plist 自启），把 fswatch tick miss /
 launchd race / kill -9 silent gap 三条已知约束在 plist 设计里兜住。
+
+
+
+
+---
+
+## Checkpoint：B.2 hotfix 生产实证 + line 573 修复（2026-05-17）
+
+> 追加日志，不改前文。本段把 cutover 当晚发现并修掉的一个崩溃 + 三件套实证记下来。
+
+### 一句话
+
+cutover 第一次启动 watcher 几秒内崩溃；找到 hotfix 引入的 ls glob 空匹配在 `set -eo pipefail` 下杀脚本的根因；改用 `find -maxdepth 1 -type f -name '*.json'` 修复；改后 hotfix 三件事 + lifecycle 3/4 档全部实证通过。
+
+### 崩溃现场（B.2 hotfix 5d4d6b4 引入的 bug）
+
+**症状**：cutover 后 `bash ops-watcher.sh` 启动后 5-10 秒内退出，`ps` 看不到进程，没有任何错误信息。
+
+**复现条件**：`ops-requests/` 目录为空（fresh watcher 的稳态）。
+
+**根因**：`scripts/ops/ops-watcher.sh` line 573（hotfix 5d4d6b4 新加的 `check_heartbeat` 内）：
+
+```bash
+queue=$(ls "$REQUESTS_DIR"/*.json 2>/dev/null | wc -l | tr -d ' ')
+```
+
+- 空目录时 `ls *.json` exit 1（macOS 默认行为）
+- `2>/dev/null` 只压 stderr，不改 exit code
+- `set -o pipefail` 让管道继承非零 exit
+- `set -e` 在赋值 RHS 失败上动手 → 杀脚本
+
+`+ queue=0` 在 `bash -x` trace 里出现，因为 wc 在空输入下输出 0；但赋值之后 set -e 才触发。这是 learnings 里 "macOS bash 3.2 + grep 零匹配 = exit 1 = 经典坑" 的近亲，只是这次 hit point 是 ls。
+
+**probe 实验钉死假设**：
+
+```
+empty ops-requests/  → watcher dies after 'queue=0' (两次 trace 完全一致)
+echo '{}' > __probe.json
+ALIVE                 → trace 走完: queue=1 → last_proposal=__probe → msg=... →
+                                    send_telegram_raw → http_code=200 → write_event
+```
+
+二值翻转，物理实验级别的对照证据。
+
+### 修法
+
+```diff
+- queue=$(ls "$REQUESTS_DIR"/*.json 2>/dev/null | wc -l | tr -d ' ')
++ queue=$(find "$REQUESTS_DIR" -maxdepth 1 -type f -name '*.json' -print 2>/dev/null | wc -l | tr -d ' ')
+```
+
+commit `3c0a60c` 一行修复 + bash -n 通过。
+
+### 设计层面的教训（值得保留为原则）
+
+第一直觉的 fallback `... || echo "0"` **正确性更低**：
+
+- 空匹配时 `wc -l` 已经输出了一行 `0`，再追加 fallback 的 `0` → `queue=$'0\n0'`
+- 后续 `printf "queue=%s"` 渲染成两行 0
+- jq `--arg q "$queue"` 拿到带换行的字符串
+
+`find` 的契约和 `ls` 不同：**找不到匹配安静返回 exit 0 + stdout 空**，wc 拿到空输入输出 0，整条管道天然干净。
+
+**原则**：工具语义和需求不对齐时，**换工具**比"包 fallback 兜底"更稳。fallback 链本身会引入"成功路径污染"这种隐性 bug，是 N+1 个修复带 N+2 个新坑的来源。
+
+副作用是诊断能力变差一点（find 把"目录失败"和"目录空"合并成同一个 stdout 空），但这是单独的问题——应该用启动自检 `[ -d "$REQUESTS_DIR" ] || die ...` 解决，不该塞到队列计数那一行里。一行职责单一原则。
+
+### 已实证清单（line 573 修复后，连续 5+ 个 tick 稳定）
+
+| 维度 | 证据 |
+|---|---|
+| watcher 主循环不崩 | `ps` 一直能看到进程；连续 5+ heartbeat tick 没退出 |
+| `TELEGRAM_PROXY_URL` 专用代理变量 | started + heartbeat 全部 `http_code=200`，curl 走的是 `--proxy` 显式参数 |
+| `LAST_TELEGRAM_HTTP_CODE` 成功路径 | events.jsonl 每条 lifecycle/heartbeat 都带 `http_code` 字段 |
+| `LAST_TELEGRAM_HTTP_CODE` 失败路径 | 12:11:03 一条意外的 `heartbeat send failed http_code:000`（用户当时切了 SR），完美演示了诊断价值——000 = 连不通代理 |
+| `check_heartbeat` 端到端心跳 | 60s 间隔下连续 5 次 heartbeat 发到手机；`watcher + 代理 + telegram` 三件事都活着的端到端证明 |
+| heartbeat 失败不阻断主流程 | 12:11:03 失败后下一次 12:11:39 仍然正常发出 disabled 通知，主循环未受影响 |
+| `.last-heartbeat` 失败也推进 | 12:11:03 失败后没有 polling 2s 一次刷 error 洪流 |
+
+### Lifecycle 4 档：3/4 已实证
+
+| 档 | 触发 | 实测时间 | http_code | 状态 |
+|---|---|---|---|---|
+| started | `bash ops-watcher.sh` 启动 | 12:05:54 | 200 | ✅ |
+| disabled | `touch .ops-watcher.disabled` | 12:11:39 | 200 | ✅ |
+| resumed | `rm .ops-watcher.disabled` | 12:11:42 | 200 | ✅ |
+| stopped | Ctrl-C / SIGTERM | — | — | 留到 B.3 末尾测 |
+
+**首次启动 prev="" 不发 resumed** 这条设计内的边界也间接实证：12:05:54 那次 started 之后**没有**额外的 resumed 出现，符合 `check_lifecycle_edge` 的"prev 是 disabled 才发 resumed"逻辑。
+
+`.lifecycle-state` 文件最终内容 `enabled`，绕一圈回到原点，state 机干净。
+
+### 三条 hardening 约束的部分实证
+
+| 约束 | 实证情况 |
+|---|---|
+| 1. `.notified.txt` 只存 proposal 三元组 | 部分实证 — lifecycle 全部走完没污染 `.notified.txt`（heartbeat 有 5+ 次也没进表）；proposal 部分留待 B.3 |
+| 2. disabled/resumed 边沿检测 | ✅ 12:11:39 + 12:11:42 各一条；polling 模式 2s tick 没有重复发 |
+| 3. `.notified.txt` 只在 HTTP 200 之后追加 | 部分实证 — heartbeat 12:11:03 失败时没向 `.notified.txt` 写任何东西（heartbeat 本来就不进表，但行为正确）；proposal 失败路径留待 B.3 |
+
+### 已知现场状态（继续 B.3 前必读）
+
+`ops-results/` 内有 9 个 B.1 时代的真 proposal 残留，其中：
+
+- `20260517-084006-28b44c` 仍是 `accepted_for_review LOW`，**仍占位** `proxy/allowed_domains.txt`
+- 其他 8 个都已闭合（superseded / blocked / conflict）
+
+按 effective_status 投影规则，只有 084006 仍占位。下一步 B.3 LOW 档测试需要决定怎么处理这条占位（路径白名单的"典型 LOW"就是改 `proxy/allowed_domains.txt`）。
+
+读这条 manifest 后确认它本身就是 B.1 烟雾弹（`reason: B.1 smoke test (supersedes old accepted)`），不是真业务意图。下一步 B.3 LOW 测试**用新 proposal 显式 supersede 它**，一举两得：
+
+- 顺手清掉 B.1 唯一遗留的幽灵占位
+- LOW happy path 走最 canonical 的白名单加域名路径
+- 同时实证 hotfix 后的 `supersedes` 仍能正确释放占位（B.1 hotfix v2 effective_status 抽象的第二轮生产实证）
+
+### 修复后 watcher 仍是前台跑着的（写本段时）
+
+```
+caimin@... 38521 ... bash /Users/caimin/ai_sandbox/scripts/ops/ops-watcher.sh
+```
+
+下一步直接进 B.3 proposal 4 档不需要重启 watcher，直接 submit 即可。
+
+### B.3 / B.4 待办（缩窄一档）
+
+- B.3 proposal 4 档（status × risk matrix）—— 即将做
+  - LOW：白名单加域名 + supersedes 084006
+  - MEDIUM：notifier/notifier.py 改文案 或 proxy/squid.conf 改 ACL
+  - HIGH：docker-compose.yml 加新服务
+  - BLOCK：试图改 claude_config 路径下任意文件（被路径白名单拒）
+- B.3 失败路径（断网/假端口 → LOW proposal → http_code=000 + `.notified.txt` 不污染）
+- B.3 lifecycle stopped（Ctrl-C）
+- B.4 launchd plist 开机自启
