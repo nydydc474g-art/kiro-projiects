@@ -87,6 +87,50 @@ file_sha256() {
   $SHA256_CMD "$1" | awk '{print $1}'
 }
 
+# B.1 fix v2: proposal 当前生命周期投影（不只是初始裁决）
+#
+# Why: <id>.json 一旦写入即只读（协议不变量），但 proposal 实际状态会通过
+# sibling 文件演进（.superseded.json 现在；.applied.json / .rolled_back.json 未来）。
+# 任何 watcher 决策（conflict 占位、supersedes target 是否合法、未来 apply 队列）
+# 都必须读 effective_status，不能直接读 .json.status——否则就会用过期视图判断当前。
+#
+# 一期 sibling: .superseded.json
+# 未来 sibling: .applied.json / .rolled_back.json (Phase 4)
+#
+# Returns one of:
+#   "" (proposal 不存在)
+#   pending (有 proposal 目录但 watcher 还没处理出 result)
+#   accepted_for_review / blocked / rejected / preflight_failed /
+#   stale / conflict / disabled (来自 .json.status，无 sibling)
+#   superseded (sibling 投影；可在 Phase 4 扩为 applied / rolled_back)
+get_effective_status() {
+  local id="$1"
+  local proposal_dir="$PROPOSALS_DIR/$id"
+  local result_file="$RESULTS_DIR/$id.json"
+
+  # 不存在 = ""
+  if [ ! -d "$proposal_dir" ]; then
+    echo ""
+    return 0
+  fi
+
+  # 没 result = pending（watcher 还没处理或 proposal 还没 submit）
+  if [ ! -f "$result_file" ]; then
+    echo "pending"
+    return 0
+  fi
+
+  # sibling 优先（按 lifecycle 演进顺序检查）
+  # 一期只有 superseded；Phase 4 在此处加 applied / rolled_back
+  if [ -f "$RESULTS_DIR/$id.superseded.json" ]; then
+    echo "superseded"
+    return 0
+  fi
+
+  # 回落到初始裁决
+  jq -r '.status // "unknown"' "$result_file" 2>/dev/null || echo "unknown"
+}
+
 # 加载 baseline
 load_baseline() {
   if [ ! -f "$BASELINE_FILE" ]; then
@@ -534,38 +578,42 @@ check_conflict() {
   local our_paths
   our_paths=$(jq -r '.changes[].path' "$manifest" | sort -u)
 
-  # 找所有"pending"（已 submit 但还没 result）proposals，排除自己
+  # B.1 fix v2: 通过 effective_status 抽象判定占位
+  # 占位 = effective_status ∈ {accepted_for_review, pending}
+  # （pending = 已 submit 还没出 result；accepted_for_review = 出了 result 仍占位）
+  # 其他状态（superseded / blocked / rejected / preflight_failed / stale / conflict / disabled）
+  # 都已闭合，不再占用任何路径
+  #
+  # supersedes target 必须当前仍占位（即 accepted_for_review；不能是 pending，因为
+  # 一个还没被审查的 proposal 不应被新 proposal "替代"——新的应该等旧的先出结果）
   local pending_ids=()
   for d in "$PROPOSALS_DIR"/*/; do
     [ -d "$d" ] || continue
     local other
     other=$(basename "$d")
     [ "$other" = "$id" ] && continue
-    # 必须有 submit request 且无 result
+    # 必须真的提交过（有 submit request 痕迹）
     [ -f "$REQUESTS_DIR/$other.json" ] || [ -f "$REQUESTS_DIR/.processed/$other.json" ] || continue
-    if [ -f "$RESULTS_DIR/$other.json" ]; then
-      local other_status
-      other_status=$(jq -r '.status' "$RESULTS_DIR/$other.json" 2>/dev/null || echo "unknown")
-      # 只有 accepted_for_review 是真正"占位"的；其他终态不视为 conflict
-      [ "$other_status" = "accepted_for_review" ] || continue
-      # B.1 fix: 若该 proposal 已被 sibling 标记为 superseded，亦不视为占位
-      [ -f "$RESULTS_DIR/$other.superseded.json" ] && continue
-    fi
-    pending_ids+=("$other")
+    local other_eff
+    other_eff=$(get_effective_status "$other")
+    case "$other_eff" in
+      accepted_for_review|pending)
+        pending_ids+=("$other")
+        ;;
+      *)
+        # 闭合状态（含 superseded / blocked / 等），跳过
+        ;;
+    esac
   done
 
   # 处理 supersedes 声明
+  # 注意：supersedes target 必须 effective_status == accepted_for_review
+  # （pending 不允许；闭合状态肯定不在 pending_ids 里所以也找不到）
   if [ -n "$supersedes" ]; then
-    # 必须确实存在且是 pending
-    local found=0
-    for pid in "${pending_ids[@]}"; do
-      if [ "$pid" = "$supersedes" ]; then
-        found=1
-        break
-      fi
-    done
-    if [ "$found" = "0" ]; then
-      eval "$reason_var=\"supersedes target '$supersedes' not found among pending proposals\""
+    local target_eff
+    target_eff=$(get_effective_status "$supersedes")
+    if [ "$target_eff" != "accepted_for_review" ]; then
+      eval "$reason_var=\"supersedes target '$supersedes' has effective_status='$target_eff' (must be accepted_for_review)\""
       return 1
     fi
   fi
