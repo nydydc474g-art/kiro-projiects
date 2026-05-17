@@ -912,3 +912,55 @@ baseline invariant 真比对（A.1-1 验证）：
 - apply-proposal.sh（Phase 4）
 - verifications/ 命名检查项库（Phase 5）
 - 真实 docker compose up（Phase 4）
+
+
+
+
+---
+
+## Checkpoint：B.2 Telegram 单向摘要通知（2026-05-17）
+
+### 设计原则
+
+**Telegram 是注意力通道，不是状态总线。**accepted_for_review 表示"有东西值得你看"，BLOCK 表示"有东西值得你知道"，这两类最配占用人的注意力。其他状态（conflict / stale / rejected / preflight_failed）往往只是 agent 自己探索时的摩擦，全推会把真正值得看的通知淹掉。
+
+### 通知策略：status × risk matrix（不只看 risk）
+
+| status × risk | 行为 |
+|---|---|
+| accepted_for_review × LOW | 推送（普通摘要） |
+| accepted_for_review × MEDIUM | 推送（普通摘要） |
+| accepted_for_review × HIGH | 推送（明显警示，要求 `--high` 应用） |
+| blocked × BLOCK | 推送（"已拦截"，红色警告） |
+| conflict / stale / rejected / preflight_failed / disabled | 静默（仅写 events.jsonl） |
+| superseded（sibling 事件） | 静默（见下） |
+
+文案分层：LOW=✅ MEDIUM=🟡 HIGH=🔴 BLOCK=🚨。每条 ≤ 4KB；不带 manifest 自由文本（防 agent 借 Telegram 留言）；reason 截断 200 字符。
+
+### 三条实现约束（B.2 hardening）
+
+1. **幂等表 `.notified.txt` 只用于 proposal 通知**，三元组 `<id>:<status>:<risk>` 去重。
+   lifecycle 事件（started/stopped/disabled/resumed）**不进** `.notified.txt`——否则 watcher 第二次正常启动后再也发不出 started。
+2. **disabled / resumed 必须边沿检测**（state file `.lifecycle-state`），只在 `.ops-watcher.disabled` 状态切换时发，不允许主循环每轮都发。
+3. **`.notified.txt` 只能在 sendMessage 成功（HTTP 200）后追加**。失败只记 events.jsonl ERROR，**永不**预先标记"已通知"——一次网络故障不能伪装为送达。
+
+### Superseded 静默 → Phase 4 必须的兜底
+
+按上面策略，被 supersede 的 proposal 不发新通知。这意味着：
+
+```
+T0: ops 084006 → accepted_for_review LOW    (你手机收到)
+T1: ops 090510 → accepted_for_review LOW    (supersede 084006)
+T2: 你看历史，敲 ops 084006 ...
+```
+
+→ **`apply-proposal.sh`（Phase 4）必须在 apply 前重新读 `get_effective_status(id)`，检查不是 superseded / applied / rolled_back**，否则会 apply 一个早已被替代的 proposal。
+
+Telegram 只回答"它曾值得看"。"它现在还值不值得 apply" 是 apply 阶段的责任。这是 effective_status 抽象在 Phase 4 的第二个落点（第一个是 watcher 的 conflict 检查）。
+
+### 安全边界
+
+- 单向：watcher 只 POST `sendMessage`，永不调 `getUpdates` / 不开 webhook。Telegram bot token 只用于"发"。
+- 失败不阻断：sendMessage 失败只记 events.jsonl ERROR，watcher 主流程不感知。
+- 独立 env 文件：`~/ai_sandbox/.ops-watcher.env`（chmod 600），与 docker-compose `.env` 隔离。最小授权——watcher 不需要 LLM key / 搜索 key 等。
+- 权限不对降级：env 文件不存在或 perms ≠ 600 → `TELEGRAM_DISABLED=1`，watcher 仍跑，仅不发通知。
