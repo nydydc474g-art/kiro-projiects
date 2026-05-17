@@ -1,0 +1,192 @@
+services:
+  squid:
+    image: ubuntu/squid
+    container_name: squid
+    restart: unless-stopped
+    volumes:
+      - ./proxy/squid.conf:/etc/squid/squid.conf:ro
+      - ./proxy/allowed_domains.txt:/etc/squid/allowed_domains.txt:ro
+    networks:
+      - sandbox_net
+      - internet_access
+
+  litellm:
+    image: ghcr.io/berriai/litellm:main-latest
+    container_name: litellm
+    restart: unless-stopped
+    volumes:
+      - ./config/litellm_config.yaml:/app/config.yaml:ro
+    command: --config /app/config.yaml
+    environment:
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - CLIPROXYAPI_KEY=${CLIPROXYAPI_KEY}
+      - HTTPS_PROXY=http://squid:3128
+      - NO_PROXY=localhost,127.0.0.1,cliproxyapi,squid
+      - no_proxy=localhost,127.0.0.1,cliproxyapi,squid
+    networks:
+      - sandbox_net
+      - internet_access
+    depends_on:
+      - squid
+      - cliproxyapi
+
+  collector:
+    build:
+      context: ./collector
+      dockerfile: Dockerfile
+      args:
+        - HOST_UID=${HOST_UID}
+        - HOST_GID=${HOST_GID}
+    container_name: collector
+    user: "${HOST_UID}:${HOST_GID}"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    volumes:
+      - ./audit_spool:/var/log/audit:rw
+    tmpfs:
+      - /tmp:size=32m
+    networks:
+      - sandbox_net
+
+  notifier:
+    build:
+      context: ./notifier
+      dockerfile: Dockerfile
+      args:
+        - HOST_UID=${HOST_UID}
+        - HOST_GID=${HOST_GID}
+    container_name: notifier
+    user: "${HOST_UID}:${HOST_GID}"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    volumes:
+      - ./audit_spool:/var/log/audit:ro
+    environment:
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
+      - HTTPS_PROXY=http://squid:3128
+    networks:
+      - sandbox_net
+    depends_on:
+      - collector
+
+  cliproxyapi:
+    image: eceasy/cli-proxy-api:latest
+    container_name: cliproxyapi
+    restart: unless-stopped
+    environment:
+      - HTTP_PROXY=http://squid:3128
+      - HTTPS_PROXY=http://squid:3128
+      - http_proxy=http://squid:3128
+      - https_proxy=http://squid:3128
+      - NO_PROXY=localhost,127.0.0.1
+      - no_proxy=localhost,127.0.0.1
+    volumes:
+      - ./cliproxyapi/config.yaml:/CLIProxyAPI/config.yaml
+      - ./cliproxyapi/auths:/root/.cli-proxy-api
+    networks:
+      - sandbox_net
+      - internet_access
+  agent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        - HOST_UID=1000
+        - HOST_GID=1000
+    container_name: agent
+    user: "1000:1000"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 2g
+    cpus: 2.0
+    pids_limit: 256
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+    tmpfs:
+      - /home/developer:uid=1000,gid=1000,mode=0755,size=512m
+      - /tmp:rw,noexec,nosuid,size=512m,mode=1777
+      - /home/developer/.cache:rw,nosuid,size=256m,uid=1000,gid=1000,mode=0755
+      - /home/developer/.config:rw,nosuid,size=128m,uid=1000,gid=1000,mode=0755
+      - /home/developer/.local/state:rw,nosuid,size=128m,uid=1000,gid=1000,mode=0755
+    volumes:
+      - ./agent_workspace:/app/workspace:rw
+      - ./claude_config:/app/.claude:ro
+      - ./audit_spool:/var/log/audit:ro
+    working_dir: /app/workspace
+    environment:
+      - HOME=/home/developer
+      - XDG_CONFIG_HOME=/home/developer/.config
+      - XDG_CACHE_HOME=/home/developer/.cache
+      - XDG_STATE_HOME=/home/developer/.local/state
+      - ANTHROPIC_BASE_URL=http://litellm:4000
+      - ANTHROPIC_API_KEY=sandbox-dummy-token
+      - ANTHROPIC_MODEL=${ANTHROPIC_MODEL}
+      - ANTHROPIC_DEFAULT_OPUS_MODEL=${ANTHROPIC_DEFAULT_OPUS_MODEL}
+      - ANTHROPIC_DEFAULT_SONNET_MODEL=${ANTHROPIC_DEFAULT_SONNET_MODEL}
+      - ANTHROPIC_DEFAULT_HAIKU_MODEL=${ANTHROPIC_DEFAULT_HAIKU_MODEL}
+      - CLAUDE_CODE_SUBAGENT_MODEL=${CLAUDE_CODE_SUBAGENT_MODEL}
+      - TAVILY_API_KEY=${TAVILY_API_KEY}
+      - BRAVE_SEARCH_API_KEY=${BRAVE_SEARCH_API_KEY}
+      - EXA_API_KEY=${EXA_API_KEY}
+      - SERPER_API_KEY=${SERPER_API_KEY}
+      - HTTP_PROXY=http://squid:3128
+      - HTTPS_PROXY=http://squid:3128
+      - http_proxy=http://squid:3128
+      - https_proxy=http://squid:3128
+      - CLAUDE_CODE_DISABLE_TELEMETRY=1
+      - NO_PROXY=localhost,127.0.0.1,::1,litellm,squid,collector,cliproxyapi,notifier
+      - no_proxy=localhost,127.0.0.1,::1,litellm,squid,collector,cliproxyapi,notifier
+    extra_hosts:
+      - "api.anthropic.com:1.1.1.1"
+      - "platform.claude.com:1.1.1.1"
+      - "raw.githubusercontent.com:1.1.1.1"
+      - "statsig.anthropic.com:1.1.1.1"
+      - "downloads.claude.ai:1.1.1.1"
+    networks:
+      - sandbox_net
+    entrypoint: []
+    command: >
+      /bin/bash -c "
+      mkdir -p ~/.cache ~/.config ~/.local/state ~/.claude &&
+      cp -r /app/.claude/. ~/.claude/ &&
+      echo '{}' > ~/.claude.json &&
+      exec /bin/bash"
+    stdin_open: true
+    tty: true
+    depends_on:
+      - collector
+      - squid
+      - litellm
+
+networks:
+  sandbox_net:
+    internal: true
+  internet_access:
+    internal: false
