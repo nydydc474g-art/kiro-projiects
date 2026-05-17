@@ -246,6 +246,204 @@ check_manifest_schema() {
   return 0
 }
 
+# A.1-2: candidate file 重验
+# watcher 不信任 helper 写入的 manifest，重新校验候选文件本体：
+#   - 必须存在
+#   - 不能是 symlink
+#   - 必须是普通文件
+#   - 实际 sha256 必须等于 manifest 声明
+#   - 全部 changes 都是 no-op vs snapshot 时拒绝
+check_candidate_files() {
+  local id="$1" reason_var="$2"
+  local manifest="$PROPOSALS_DIR/$id/manifest.json"
+  local proposal_dir="$PROPOSALS_DIR/$id"
+
+  local n
+  n=$(jq '.changes | length' "$manifest")
+  local i=0
+  local n_noop=0
+  while [ $i -lt "$n" ]; do
+    local p declared_sha
+    p=$(jq -r ".changes[$i].path" "$manifest")
+    declared_sha=$(jq -r ".changes[$i].sha256 // \"\"" "$manifest")
+    local file="$proposal_dir/$p"
+
+    # (a) 必须存在
+    if [ ! -e "$file" ]; then
+      eval "$reason_var=\"changes[$i].path '$p' missing in proposal dir\""
+      return 1
+    fi
+    # (b) 不能是 symlink（在 -f 之前检查）
+    if [ -L "$file" ]; then
+      eval "$reason_var=\"changes[$i].path '$p' is a symlink (not allowed)\""
+      return 1
+    fi
+    # (c) 必须是普通文件（拒绝 directory / device / fifo / 等）
+    if [ ! -f "$file" ]; then
+      eval "$reason_var=\"changes[$i].path '$p' is not a regular file\""
+      return 1
+    fi
+    # (d) 实际 sha256 必须等于 declared
+    if [ -n "$declared_sha" ]; then
+      local actual_sha
+      actual_sha=$(file_sha256 "$file")
+      if [ "$actual_sha" != "$declared_sha" ]; then
+        eval "$reason_var=\"changes[$i].path '$p' sha256 drift (manifest=$declared_sha, actual=$actual_sha)\""
+        return 1
+      fi
+    fi
+    # (e) no-op 统计：候选与 snapshot 内容完全相同
+    local snap_file="$SNAPSHOT_DIR/current/$p"
+    if [ -f "$snap_file" ]; then
+      local snap_sha
+      snap_sha=$(file_sha256 "$snap_file")
+      if [ "$snap_sha" = "$(file_sha256 "$file")" ]; then
+        n_noop=$((n_noop + 1))
+      fi
+    fi
+    i=$((i + 1))
+  done
+
+  # (f) 全 no-op 拒绝
+  if [ "$n_noop" -gt 0 ] && [ "$n_noop" = "$n" ]; then
+    eval "$reason_var=\"all $n change(s) are no-op vs snapshot\""
+    return 1
+  fi
+
+  return 0
+}
+
+# A.1-1: baseline invariant compare
+# 仅当 changes 含 docker-compose.yml 时检查
+# 拒绝场景：
+#   - agent 服务的 read_only / cap_drop / security_opt / user 与 baseline 不一致
+#   - agent 必须挂载的卷（baseline.agent_volumes_required）有任何一项缺失
+# 工具缺失：
+#   - 无 docker → 视为 inconclusive；compose 改动时拒绝（保守）
+check_baseline_invariants() {
+  local id="$1" reason_var="$2"
+  local manifest="$PROPOSALS_DIR/$id/manifest.json"
+  local proposal_dir="$PROPOSALS_DIR/$id"
+
+  # 是否改了 compose
+  local compose_in_proposal=""
+  local n
+  n=$(jq '.changes | length' "$manifest")
+  local i=0
+  while [ $i -lt "$n" ]; do
+    local p
+    p=$(jq -r ".changes[$i].path" "$manifest")
+    if [ "$p" = "docker-compose.yml" ]; then
+      compose_in_proposal="$proposal_dir/docker-compose.yml"
+      break
+    fi
+    i=$((i + 1))
+  done
+
+  # 没改 compose 就不检查
+  [ -z "$compose_in_proposal" ] && return 0
+  [ -f "$compose_in_proposal" ] || return 0
+
+  # 必须有 docker 才能验证 invariants（保守拒绝）
+  if ! command -v docker >/dev/null 2>&1; then
+    eval "$reason_var=\"compose changed but docker unavailable to verify baseline invariants\""
+    return 1
+  fi
+
+  # 用 docker compose config 拿到结构化 JSON
+  local compose_json
+  if ! compose_json=$(docker compose -f "$compose_in_proposal" config --format json 2>/dev/null); then
+    eval "$reason_var=\"compose config parse failed (cannot verify invariants)\""
+    return 1
+  fi
+
+  # === 1. agent 服务安全字段比对 ===
+  local expected actual
+
+  # read_only
+  expected=$(jq -r '.agent_service_invariants.read_only' "$BASELINE_FILE")
+  actual=$(echo "$compose_json" | jq -r '.services.agent.read_only // false')
+  if [ "$actual" != "$expected" ]; then
+    eval "$reason_var=\"agent.read_only=$actual, baseline requires $expected\""
+    return 1
+  fi
+
+  # cap_drop（必须包含 baseline 列出的所有项；不限制额外项）
+  local required_caps
+  required_caps=$(jq -r '.agent_service_invariants.cap_drop[]' "$BASELINE_FILE")
+  while IFS= read -r cap; do
+    [ -z "$cap" ] && continue
+    if ! echo "$compose_json" | jq -e --arg c "$cap" '.services.agent.cap_drop | index($c)' >/dev/null 2>&1; then
+      eval "$reason_var=\"agent.cap_drop missing required: $cap\""
+      return 1
+    fi
+  done <<< "$required_caps"
+
+  # security_opt（必须包含 baseline 列出的所有项）
+  local required_secopts
+  required_secopts=$(jq -r '.agent_service_invariants.security_opt_required[]' "$BASELINE_FILE")
+  while IFS= read -r opt; do
+    [ -z "$opt" ] && continue
+    if ! echo "$compose_json" | jq -e --arg o "$opt" '.services.agent.security_opt | index($o)' >/dev/null 2>&1; then
+      eval "$reason_var=\"agent.security_opt missing required: $opt\""
+      return 1
+    fi
+  done <<< "$required_secopts"
+
+  # user
+  expected=$(jq -r '.agent_service_invariants.user' "$BASELINE_FILE")
+  actual=$(echo "$compose_json" | jq -r '.services.agent.user // ""')
+  if [ "$actual" != "$expected" ]; then
+    eval "$reason_var=\"agent.user='$actual', baseline requires '$expected'\""
+    return 1
+  fi
+
+  # === 2. agent 必须挂载的卷比对 ===
+  # docker compose config 把 volumes 展开成对象数组（{type, source, target, read_only}）
+  # 提取成 "<source>:<target>:<mode>" 字符串
+  local mounts_normalized
+  mounts_normalized=$(echo "$compose_json" | jq -r '
+    .services.agent.volumes // [] | map(
+      if type == "object" then
+        "\(.source // "")" + ":" + "\(.target // "")" +
+        (if .read_only then ":ro" else ":rw" end)
+      else
+        .
+      end
+    ) | .[]
+  ')
+
+  local required_vols
+  required_vols=$(jq -r '.agent_volumes_required[]' "$BASELINE_FILE")
+  while IFS= read -r req; do
+    [ -z "$req" ] && continue
+    # baseline 里是 "./agent_workspace:/app/workspace:rw"
+    # 提取 target 和 mode；source 跳过（绝对/相对路径差异）
+    local req_target req_mode
+    req_target=$(echo "$req" | awk -F: '{print $2}')
+    req_mode=$(echo "$req" | awk -F: '{print $3}')
+
+    local found=0
+    while IFS= read -r m; do
+      [ -z "$m" ] && continue
+      local m_target m_mode
+      m_target=$(echo "$m" | awk -F: '{print $2}')
+      m_mode=$(echo "$m" | awk -F: '{print $3}')
+      if [ "$m_target" = "$req_target" ] && [ "$m_mode" = "$req_mode" ]; then
+        found=1
+        break
+      fi
+    done <<< "$mounts_normalized"
+
+    if [ "$found" = "0" ]; then
+      eval "$reason_var=\"agent missing required volume mount: $req\""
+      return 1
+    fi
+  done <<< "$required_vols"
+
+  return 0
+}
+
 # 检查 changes 中是否有 BLOCK 路径
 check_block_paths() {
   local id="$1" reason_var="$2"
@@ -475,9 +673,6 @@ check_manifest_whitelists() {
   while [ $i -lt "$n_svcs" ]; do
     local svc
     svc=$(jq -r ".affected_services[$i]" "$manifest")
-    local in_list
-    in_list=$(jq -r --arg s "$svc" 'index($s) // "no"' "$BASELINE_FILE/dev/null" 2>/dev/null || echo "no")
-    # 上面那行 jq 写法不对，用下面的：
     if ! echo "$allowed_svcs_json" | jq -e --arg s "$svc" 'index($s)' >/dev/null 2>&1; then
       eval "$reason_var=\"affected_services[$i]='$svc' not in allowed_services\""
       return 1
@@ -698,6 +893,16 @@ process_request() {
     return
   fi
 
+  # 3b. (A.1-2) candidate file 重验（watcher 不信任 helper）
+  reason=""
+  if ! check_candidate_files "$id" reason; then
+    write_event "error" "candidate file check rejected: $reason" "$id" '{}'
+    write_result "$id" "rejected" "UNKNOWN" "$reason" '{}' '{}'
+    consume_request "$id"
+    archive_proposal "$id"
+    return
+  fi
+
   # 4. stale
   reason=""
   if ! check_stale "$id" reason; then
@@ -747,6 +952,16 @@ process_request() {
   reason=""
   if ! check_global_rules "$id" reason; then
     write_event "error" "global rule violation: $reason" "$id" '{}'
+    write_result "$id" "blocked" "BLOCK" "$reason" '{}' '{}'
+    consume_request "$id"
+    archive_proposal "$id"
+    return
+  fi
+
+  # 6b. (A.1-1) baseline invariants（compose 改动时验证）
+  reason=""
+  if ! check_baseline_invariants "$id" reason; then
+    write_event "error" "baseline invariant violation: $reason" "$id" '{}'
     write_result "$id" "blocked" "BLOCK" "$reason" '{}' '{}'
     consume_request "$id"
     archive_proposal "$id"
