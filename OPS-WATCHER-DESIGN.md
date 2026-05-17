@@ -1197,3 +1197,93 @@ started ✅ disabled ✅ resumed ✅ / stopped 留到 B.3 末尾测（Ctrl-C 是
 - B.3 proposal 4 档（status × risk matrix）即将做，LOW 档将顺手 supersede 084006 这条 B.1 时代留下的烟雾弹 proposal
 - B.3 失败路径主动测试（断网 → 验证 `.notified.txt` 不被污染）
 - B.4 launchd 自启，加 SR 启动顺序约束 + heartbeat 作为侧面信号
+
+
+
+
+---
+
+## Checkpoint：B.3 proposal 3/4 档生产实证（2026-05-17）
+
+> LOW / MEDIUM / HIGH 三档生产实证完成。BLOCK 留给下窗口。
+> 完整实测证据 + proposal id + .notified.txt 累积情况见
+> `HANDOFF-OPS-WATCHER.md` 同名 checkpoint。
+
+### 设计层面：HIGH 路径的特别意义
+
+LOW 和 MEDIUM 在 watcher 状态流里**不触发** isolated_preflight 的实质工作：
+
+```
+LOW (proxy/allowed_domains.txt):       compose_config=not_run, dockerfile_lint=not_run
+MEDIUM (proxy/squid.conf):              compose_config=not_run, dockerfile_lint=not_run
+HIGH (docker-compose.yml):              compose_config=OK,      dockerfile_lint=not_run
+```
+
+`compose_config=not_run` 不是失败，是设计内：watcher 只在改了 docker-compose.yml 时才 `docker compose config` 验一遍，避免 LOW 档每次为白名单加一条域名都触发 docker daemon 调用。
+
+所以 HIGH 这一档**真正穿过整条管道**：
+
+```
+disabled → manifest schema → BLOCK paths → candidate files →
+stale → conflict → global rules → baseline invariants →    ← 这两道在 HIGH 才有实质工作
+manifest whitelists → isolated preflight → classify → HIGH
+                      ↑
+                  这一道 compose_config 真跑了
+```
+
+LOW / MEDIUM 在中间几道是"路径不涉及 → 跳过"。HIGH 是"路径涉及 + 全部检查通过"。这意味着：
+
+> HIGH 通过 = 守门链完整闭合 + 没人能从 LOW/MEDIUM 路径偷懒绕过 baseline invariants。
+
+如果某天有 bug 让 baseline invariants 在 HIGH 路径上被跳过，这个 checkpoint 的实测就会回退——这是测试的回归参考点。
+
+### 设计层面：status × risk matrix 矩阵闭合度
+
+按 B.2 hotfix 设计的通知策略矩阵：
+
+```
+推送：accepted_for_review × {LOW, MEDIUM, HIGH}    blocked × BLOCK
+静默：conflict / stale / rejected / preflight_failed / disabled / superseded
+```
+
+矩阵 4 个推送格子 + N 个静默格子。本次实证完成 3 个推送格子（LOW/MEDIUM/HIGH）+ 1 个静默格子（superseded，通过 084006 间接实证）。
+
+剩 1 个推送格子（BLOCK × blocked）+ 多个静默格子（conflict / stale / rejected / preflight_failed / disabled）需要后续测试。其中 BLOCK 是最后一块涉及"通知行为"的拼图，剩下的静默格子在前期 Step A.1 测试集（T2-T18）已通过 watcher 内部状态测过，不一定要在 B.3 里再走一遍 telegram 端验证。
+
+### 设计层面：path 白名单与风险分级的对应关系
+
+这次三档把 `PROPOSAL_PATH_ALLOWED` 与 `classify_risk` 的对应关系实测了一次：
+
+| 路径 | 在白名单内 | 风险分级 | 工程含义 |
+|---|---|---|---|
+| `proxy/allowed_domains.txt` | ✓ | LOW | 数据/文案改动 |
+| `proxy/squid.conf` | ✓ | MEDIUM | 代理规则改动 |
+| `config/litellm_config.yaml` | ✓ | MEDIUM | 服务配置改动 |
+| `Dockerfile` (任一服务) | ✓ | MEDIUM | 镜像构建产物改动 |
+| `collector/collector.py` / `notifier/notifier.py` | ✓ | MEDIUM | 服务代码改动 |
+| `docker-compose.yml` | ✓ | HIGH | 拓扑/资源/网络/挂载改动 |
+| `claude_config/**` / `.env` / `audit_spool/**` | ✗ | BLOCK | 不变量路径 |
+
+这不是 HIGH > MEDIUM > LOW 的简单大小关系——是**改这类文件最坏会有什么后果**的工程判断：
+
+- LOW = "agent 自作主张加了个域名，最坏后果 = 多了一条不该过的请求，可逆"
+- MEDIUM = "agent 改了构建产物 / 服务配置，最坏后果 = 该服务行为变了，需要 settling + verification"
+- HIGH = "agent 改了 compose 拓扑，最坏后果 = 容器隔离假设 / 资源限制 / 网络模型变了，需要人审"
+- BLOCK = "agent 试图碰 hook / 审计 / 凭证，最坏后果 = 击穿安全模型，不可审批"
+
+### 配套抽象：B.1 hotfix v2 的 effective_status 二轮实证
+
+LOW 档 122027 顺手 supersede 084006 这条 B.1 烟雾弹时，watcher 的 `check_conflict` + `get_effective_status` 在生产再走一遍：
+
+- 122027 的 supersedes target = 084006，watcher 查 084006 的 effective_status = `accepted_for_review` → 合法
+- 旧 084006 长出 `.superseded.json` sibling，effective_status 投影从 `accepted_for_review` 切到 `superseded`
+- 后续任何 proposal 撞 `proxy/allowed_domains.txt` 路径时，watcher 通过 effective_status 投影看 084006 已闭合，不再认为它占位
+
+B.1 hotfix v2 当时在沙箱已用三组测试验证过；B.3 这次在生产代码 + 生产 watcher 进程上又走一遍，**抽象层在事实层面成立**。
+
+### B.3 / B.4 待办（缩窄一格）
+
+- B.3 BLOCK 档（绕过 helper 前端，直接手写 manifest 测 watcher 后端）
+- B.3 失败路径（断网模拟 → 验证 `.notified.txt` 不被污染）
+- B.3 lifecycle stopped（Ctrl-C 触发）
+- B.4 launchd plist 开机自启
