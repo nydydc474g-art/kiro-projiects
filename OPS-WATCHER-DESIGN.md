@@ -964,3 +964,120 @@ Telegram 只回答"它曾值得看"。"它现在还值不值得 apply" 是 apply
 - 失败不阻断：sendMessage 失败只记 events.jsonl ERROR，watcher 主流程不感知。
 - 独立 env 文件：`~/ai_sandbox/.ops-watcher.env`（chmod 600），与 docker-compose `.env` 隔离。最小授权——watcher 不需要 LLM key / 搜索 key 等。
 - 权限不对降级：env 文件不存在或 perms ≠ 600 → `TELEGRAM_DISABLED=1`，watcher 仍跑，仅不发通知。
+
+
+
+---
+
+## Checkpoint：B.2 hotfix（2026-05-17）
+
+### 触发原因（生产实测发现）
+
+第一次生产测试 `bash ops-watcher.sh`：手机收不到 started，events.jsonl 全是
+`error "telegram send failed"`。诊断闭环：
+
+```
+nc -zv api.telegram.org 443  → succeeded   （TCP 通）
+curl https://x.com           → 200          （curl/LibreSSL 健康）
+curl https://api.telegram.org → SSL_ERROR   （单域名 SNI 阻断）
+HTTPS_PROXY=http://127.0.0.1:1086 经 getMe → connection refused  （SR 端口已飘）
+HTTPS_PROXY=http://127.0.0.1:1082 经 getMe → ok:true             （新端口）
+```
+
+根因 = SR (Shadowrocket-on-Mac) 监听端口从 1086 飘到 1082，`.ops-watcher.env`
+里曾用过 `HTTPS_PROXY=http://127.0.0.1:1086`（B.2 沙箱完成时的临时方案），
+端口飘后通知静默失败。
+
+### 设计反思 → hotfix 决策
+
+诊断中发现的 B.2 三个不够干净的地方：
+
+1. **`HTTPS_PROXY` 是全局开关，污染面太大** —— watcher 未来加任何别的 curl
+   调用（Phase 4 docker compose / health probe / 任何 ops 工具链外调用）都会
+   被这个变量绑架。代理决策应该是**局部的、可读的、对单个调用显式声明**。
+
+2. **`send_telegram_raw` 抛掉 http_code 没记日志** —— 本次诊断绕大圈就是因为
+   events.jsonl 只看到 `telegram send failed`，看不到 http_code 是 000（连不通）
+   还是 401（token 错）还是 400（chat_id 错）。诊断信息缺失就是开发债。
+
+3. **lifecycle 通知是边沿信号** —— "watcher 还活着 + 代理通 + telegram 通"
+   三件事任一坏掉都没新通知（守序的失败 = 沉默的失败）。需要端到端心跳信号。
+
+### Hotfix 改动（4 处，bash 3.2 兼容）
+
+#### 1. 专用代理变量 `TELEGRAM_PROXY_URL` 替代全局 `HTTPS_PROXY`
+
+`.ops-watcher.env`:
+```
+TELEGRAM_PROXY_URL=http://127.0.0.1:1082   # 空 = 直连
+```
+
+`send_telegram_raw`:
+```bash
+local proxy_args
+proxy_args=()
+[ -n "$TELEGRAM_PROXY_URL" ] && proxy_args=(--proxy "$TELEGRAM_PROXY_URL")
+curl ... "${proxy_args[@]}" -X POST "https://api.telegram.org/.../sendMessage" ...
+```
+
+`load_telegram_env` 末尾主动 `unset HTTPS_PROXY HTTP_PROXY ALL_PROXY` 清理
+历史 env 文件可能残留的全局代理变量——避免它影响 watcher 内其他 curl。
+
+设计意图：**作用域局部化**。代理决策只对 sendMessage 一处生效，从代码这一行
+就能读出"走不走代理 + 走哪个"，未来 SR 端口再飘只改 env 一行。
+
+bash 3.2 兼容陷阱：
+- 不能用 `${arr[@]:-}`（bash 4+ 扩展），但空数组直接展开 `"${arr[@]}"` 安全
+- 不能用 `${var: -6}` 子串负偏移（bash 4+），用 `awk -F- '{print $NF}'` 替代
+
+#### 2. `LAST_TELEGRAM_HTTP_CODE` 暴露给调用方
+
+`send_telegram_raw` 把 curl 的 `%{http_code}` 写到全局变量；`notify_proposal`
+和 `notify_lifecycle` 失败分支把 http_code 写进 events.jsonl 的 details。
+
+排查指南（hotfix 后 events.jsonl 一眼就能看出根因）：
+
+| http_code | 含义 | 修法 |
+|---|---|---|
+| 000 | 连接失败（代理端口不通最常见） | 检查 TELEGRAM_PROXY_URL 是否过期 |
+| 200 | 成功 | - |
+| 401 | token 错 | 重新从 BotFather 拿 |
+| 400 / 404 | chat_id 错 | 重新 /start bot |
+| 429 | rate limit | 退避 |
+
+#### 3. heartbeat 端到端心跳
+
+每 `OPS_HEARTBEAT_INTERVAL` 秒（默认 21600 = 6h）发一次：
+
+```
+📊 watcher heartbeat
+snapshot=20260517T... queue=0 last=2e08a7
+```
+
+- 不进 `.notified.txt` 幂等表（每次都发是设计目的）
+- 失败也推进 `.last-heartbeat` 时间戳（避免代理离线时 polling 模式 2s 一次刷
+  events.jsonl error 洪流；缺失的 heartbeat 本身就是出问题信号）
+- fswatch 模式有局限性：长时间无 proposal 流量会错过 heartbeat tick。已记。
+  B.4 launchd 重构时考虑独立 timer 进程或混合模式
+
+#### 4. `.ops-watcher.env.example` 文档
+
+加 `TELEGRAM_PROXY_URL` 注释 + 现实约束声明：
+
+> 依赖本地代理时，若 watcher 由 launchd 自启而代理客户端尚未起来，started
+> 通知可能发不出（watcher 主流程不受影响）。这是天然代价，不是 bug。
+> 修复方案：B.4 launchd plist 加启动顺序约束 + heartbeat 心跳作为侧面信号。
+
+### 不变量（hotfix 没破坏）
+
+- proposal 通知幂等表 `.notified.txt` 仍只存三元组，lifecycle/heartbeat 不进
+- `.notified.txt` 仍只在 sendMessage HTTP 200 之后追加
+- disabled/resumed 仍是边沿检测，state file `.lifecycle-state` 不变
+- send_telegram_raw 失败仍不阻断 watcher 主流程
+- effective_status / superseded sibling / Phase 4 兜底声明 全部不变
+
+### B.3 / B.4 待办（不变）
+
+- B.3 完整生产 SOP：4 档 lifecycle（started/stopped/disabled/resumed）+ 4 档
+  proposal（LOW/MEDIUM/HIGH/BLOCK）+ heartbeat 一次性测完
+- B.4 launchd plist 开机自启，加启动顺序约束（依赖 SR 端口可达性）

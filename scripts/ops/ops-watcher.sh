@@ -54,6 +54,11 @@ TELEGRAM_ENV_FILE="$PROJECT_DIR/.ops-watcher.env"
 NOTIFIED_FILE="$OPS_SPOOL_DIR/.notified.txt"   # proposal 通知幂等表（仅 proposal，不含 lifecycle 事件）
 LIFECYCLE_STATE_FILE="$OPS_SPOOL_DIR/.lifecycle-state"  # 边沿检测：disabled / enabled
 TELEGRAM_DISABLED=0  # load_telegram_env 可置 1 关闭通知（不影响 watcher 主流程）
+# B.2 hotfix: 专用 Telegram 代理变量（替代曾用过的全局 HTTPS_PROXY）
+# 设计意图：作用域局部化——watcher 未来加任何别的 HTTP 调用都不会被这个变量绑架
+# 空值 = 直连 api.telegram.org（生产环境若宿主机能直连 telegram 即留空）
+TELEGRAM_PROXY_URL=""
+LAST_TELEGRAM_HTTP_CODE=""  # send_telegram_raw 写入；调用方读它写诊断日志
 
 # Polling fallback interval (when fswatch absent)
 POLL_INTERVAL=2
@@ -323,6 +328,13 @@ load_telegram_env() {
     return 0
   fi
 
+  # B.2 hotfix: 收下专用代理变量；空值 = 直连
+  # 同时清理任何意外通过 env 文件 source 进来的全局 HTTPS_PROXY/HTTP_PROXY
+  # （历史 .ops-watcher.env 可能残留 HTTPS_PROXY=...，避免它影响 watcher 内
+  #  其他 curl 的行为；只用 TELEGRAM_PROXY_URL 显式传给 send_telegram_raw）
+  TELEGRAM_PROXY_URL="${TELEGRAM_PROXY_URL:-}"
+  unset HTTPS_PROXY HTTP_PROXY https_proxy http_proxy ALL_PROXY all_proxy
+
   TELEGRAM_DISABLED=0
 }
 
@@ -389,20 +401,38 @@ format_proposal_message() {
 
 # Telegram POST；成功返回 0，失败返回 1（调用方决定要不要记 events.jsonl）
 # 失败不抛错——curl 退出非 0 是常态（网络抖动/token 错），不让 watcher 主流程崩
+# B.2 hotfix: 暴露 LAST_TELEGRAM_HTTP_CODE 给调用方写诊断日志
+#   000 = curl 连接失败（代理端口不通 / DNS / TLS 等）
+#   200 = ok
+#   401 = token 错；400/404 = chat_id 错；429 = rate limit
 send_telegram_raw() {
   local text="$1"
+  LAST_TELEGRAM_HTTP_CODE=""
   [ "$TELEGRAM_DISABLED" = "1" ] && return 1
   if ! command -v curl >/dev/null 2>&1; then
+    LAST_TELEGRAM_HTTP_CODE="no_curl"
     return 1
+  fi
+  # B.2 hotfix: 显式 --proxy 而不是依赖 HTTPS_PROXY 环境变量
+  # 1. 局部化：未来 watcher 加任何别的 curl 调用不会被这条代理绑架
+  # 2. 可读性：从这一行就能看出 telegram 调用走不走代理、走哪个
+  # 3. SR 端口飘移时只改 .ops-watcher.env 一行
+  # bash 3.2 兼容：空数组展开 "${arr[@]}" 安全；不可用 ${arr[@]:-}
+  local proxy_args
+  proxy_args=()
+  if [ -n "$TELEGRAM_PROXY_URL" ]; then
+    proxy_args=(--proxy "$TELEGRAM_PROXY_URL")
   fi
   local http_code
   http_code=$(curl -sS -o /dev/null -w "%{http_code}" \
     --max-time 10 \
+    "${proxy_args[@]}" \
     -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
     --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
     --data-urlencode "text=${text}" \
     --data-urlencode "disable_web_page_preview=true" \
-    2>/dev/null) || return 1
+    2>/dev/null) || http_code="000"
+  LAST_TELEGRAM_HTTP_CODE="$http_code"
   [ "$http_code" = "200" ] || return 1
   return 0
 }
@@ -427,10 +457,14 @@ notify_proposal() {
     mkdir -p "$(dirname "$NOTIFIED_FILE")"
     echo "$key" >> "$NOTIFIED_FILE"
     write_event "info" "telegram sent" "$id" \
-      "$(jq -n --arg s "$status" --arg r "$risk" '{kind: "proposal", status: $s, risk: $r}')"
+      "$(jq -n --arg s "$status" --arg r "$risk" --arg c "$LAST_TELEGRAM_HTTP_CODE" \
+        '{kind: "proposal", status: $s, risk: $r, http_code: $c}')"
   else
+    # B.2 hotfix: 把 http_code 记进 events.jsonl 方便排查
+    # 000 = 连接失败（代理端口不通最常见）/ 401 token 错 / 400 chat_id 错
     write_event "error" "telegram send failed" "$id" \
-      "$(jq -n --arg s "$status" --arg r "$risk" '{kind: "proposal", status: $s, risk: $r}')"
+      "$(jq -n --arg s "$status" --arg r "$risk" --arg c "$LAST_TELEGRAM_HTTP_CODE" \
+        '{kind: "proposal", status: $s, risk: $r, http_code: $c}')"
   fi
 }
 
@@ -465,10 +499,12 @@ notify_lifecycle() {
 
   if send_telegram_raw "$msg"; then
     write_event "info" "telegram sent" "" \
-      "$(jq -n --arg k "$kind" '{kind: "lifecycle", event: $k}')"
+      "$(jq -n --arg k "$kind" --arg c "$LAST_TELEGRAM_HTTP_CODE" \
+        '{kind: "lifecycle", event: $k, http_code: $c}')"
   else
     write_event "error" "telegram send failed" "" \
-      "$(jq -n --arg k "$kind" '{kind: "lifecycle", event: $k}')"
+      "$(jq -n --arg k "$kind" --arg c "$LAST_TELEGRAM_HTTP_CODE" \
+        '{kind: "lifecycle", event: $k, http_code: $c}')"
   fi
 }
 
@@ -495,6 +531,71 @@ check_lifecycle_edge() {
     esac
     mkdir -p "$(dirname "$LIFECYCLE_STATE_FILE")"
     echo "$current" > "$LIFECYCLE_STATE_FILE"
+  fi
+}
+
+# B.2 hotfix: heartbeat 端到端存活信号
+#
+# 为什么需要：lifecycle 通知只在边沿发——"watcher 还活着 + 代理通 + telegram 通"
+# 三件事任一坏掉都没信号（守序的失败 = 沉默的失败）。heartbeat 每 N 小时发一次，
+# 是端到端证明（错过 1 次 = 6h 内某环坏了）。
+#
+# 设计选择：
+# - 不进 .notified.txt 幂等表（每次都发是设计目的，不需要去重）
+# - 失败也推进 last 时间——不补发、不重试。错过 1 个 tick 就错过；下一个 tick
+#   再试。这避免代理离线时 polling 模式 2 秒一次刷 events.jsonl error 洪流。
+# - 缺失的 heartbeat 本身就是"出问题"信号——你 6h 没收到 heartbeat 就该排查
+# - 默认 21600s = 6h（4 次/天，足够发现长时间死机；可通过 OPS_HEARTBEAT_INTERVAL 调）
+#
+# 不变量：heartbeat 永不写 .notified.txt（与 lifecycle 一致：proposal 才进幂等表）
+HEARTBEAT_STATE_FILE="$OPS_SPOOL_DIR/.last-heartbeat"
+HEARTBEAT_INTERVAL="${OPS_HEARTBEAT_INTERVAL:-21600}"  # 6h 默认
+
+check_heartbeat() {
+  [ "$TELEGRAM_DISABLED" = "1" ] && return 0
+
+  local now last elapsed
+  now=$(date -u +%s)
+  last=0
+  if [ -f "$HEARTBEAT_STATE_FILE" ]; then
+    last=$(cat "$HEARTBEAT_STATE_FILE" 2>/dev/null || echo 0)
+    # 防御：cat 出来非数字（文件被外部改坏）→ 视为 0 强制发一次
+    case "$last" in
+      ''|*[!0-9]*) last=0 ;;
+    esac
+  fi
+  elapsed=$((now - last))
+  [ "$elapsed" -lt "$HEARTBEAT_INTERVAL" ] && return 0
+
+  # 收集状态：snapshot id / 待处理 request / 最近一次 result
+  local snap_id queue last_proposal
+  snap_id=$(cat "$SNAPSHOT_DIR/.snapshot-id" 2>/dev/null || echo "unknown")
+  queue=$(ls "$REQUESTS_DIR"/*.json 2>/dev/null | wc -l | tr -d ' ')
+  last_proposal=$(ls -t "$RESULTS_DIR"/*.json 2>/dev/null | head -1 | xargs -n1 basename 2>/dev/null | sed 's/\.json$//' || echo "")
+  [ -z "$last_proposal" ] && last_proposal="none"
+  # 截短 ID 显示（取最后 6 位 hex 后缀）
+  local short
+  if [ "$last_proposal" = "none" ]; then
+    short="none"
+  else
+    short=$(echo "$last_proposal" | awk -F- '{print $NF}')
+  fi
+
+  local msg
+  msg=$(printf "📊 watcher heartbeat\nsnapshot=%s queue=%s last=%s" \
+    "$snap_id" "$queue" "$short")
+
+  # 关键：无论成功失败都推进 last_time，避免代理临时挂掉时刷屏
+  echo "$now" > "$HEARTBEAT_STATE_FILE"
+
+  if send_telegram_raw "$msg"; then
+    write_event "info" "heartbeat sent" "" \
+      "$(jq -n --arg s "$snap_id" --arg q "$queue" --arg l "$last_proposal" --arg c "$LAST_TELEGRAM_HTTP_CODE" \
+        '{kind: "heartbeat", snapshot_id: $s, queue: $q, last_proposal: $l, http_code: $c}')"
+  else
+    write_event "error" "heartbeat send failed" "" \
+      "$(jq -n --arg s "$snap_id" --arg c "$LAST_TELEGRAM_HTTP_CODE" \
+        '{kind: "heartbeat", snapshot_id: $s, http_code: $c}')"
   fi
 }
 
@@ -1338,16 +1439,23 @@ main_loop() {
   echo "[ops-watcher] watching $REQUESTS_DIR"
   echo "[ops-watcher] press Ctrl-C to stop"
 
+  # B.2 hotfix: heartbeat 注入
+  # - polling 模式：每个 POLL_INTERVAL（2s）check 一次，几乎实时发出
+  # - fswatch 模式：仅在事件唤醒时 check——若长时间（> HEARTBEAT_INTERVAL）
+  #   无 proposal 流量会错过 tick。已知局限性，B.4 launchd 重构时考虑用
+  #   独立 timer 进程或切到混合模式（fswatch + 60s tick）解决
   if command -v fswatch >/dev/null 2>&1; then
     echo "[ops-watcher] using fswatch"
     # Process any pending first
     check_lifecycle_edge
+    check_heartbeat
     for id in $(list_pending_requests); do
       process_request "$id" || true
     done
     fswatch -0 "$REQUESTS_DIR" | while IFS= read -r -d '' _; do
       sleep 0.2  # debounce
       check_lifecycle_edge
+      check_heartbeat
       for id in $(list_pending_requests); do
         process_request "$id" || true
       done
@@ -1356,6 +1464,7 @@ main_loop() {
     echo "[ops-watcher] fswatch missing, falling back to polling every ${POLL_INTERVAL}s"
     while true; do
       check_lifecycle_edge
+      check_heartbeat
       for id in $(list_pending_requests); do
         process_request "$id" || true
       done
