@@ -1,6 +1,6 @@
 # Ops Watcher 脚本目录
 
-> 实施进度：**Step A 完成（静态判定内核）**
+> 实施进度：**Step A.1 完成（静态判定内核 + baseline invariant 实装 + candidate 重验）**
 
 ## 文件清单
 
@@ -9,7 +9,7 @@
 | `init-snapshot.sh` | Phase 1.2 ✅ | 宿主机生成/刷新 `.snapshot/`（versions/current 结构，7 步定序） |
 | `ops-helper.sh` | Phase 1.2 ✅ | agent 容器内 proposal 助手 |
 | `ops-baseline.json` | Step A ✅ | watcher 安全基线（不变量 + 全局禁字段 + 路径白名单） |
-| `ops-watcher.sh` | Step A ✅ | watcher 主循环 + 静态判定（不接 Telegram，不动 compose） |
+| `ops-watcher.sh` | Step A.1 ✅ | watcher 主循环 + 14 个检查模块（含 baseline invariant + candidate 重验） |
 | `verifications/` | Phase 5 ⏳ | 命名检查项目录（待补） |
 | `apply-proposal.sh` | Phase 4 ⏳ | apply/rollback 脚本（待补） |
 
@@ -39,7 +39,7 @@
   .snapshot-hash                     ← 顶层指针
 ```
 
-### 状态流（Step A）
+### 状态流（Step A.1）
 
 ```
 request detected
@@ -50,6 +50,9 @@ load manifest (jq parse)     → rejected (malformed)
 schema fields present?       → rejected
   ↓ ok
 path matches BLOCK regex?    → blocked      (claude_config/ / .env / audit_spool/ / cliproxyapi/auths/)
+  ↓ ok
+candidate file 重验          → rejected
+  (exists / not symlink / regular file / sha256 matches / not all no-op)
   ↓ ok
 base_snapshot_id != current  → stale
 or base_snapshot_hash != current
@@ -62,6 +65,11 @@ conflict on same path?
   ↓ ok
 global rules scan
   (privileged / docker.sock / cap_add / ports / host net / namespace modes)
+                              → blocked
+baseline invariants (compose 改动时)
+  agent service: read_only / cap_drop / security_opt / user
+  agent volumes: required mounts present (target + ro/rw 一致)
+  docker missing → 保守拒绝
                               → blocked
 manifest whitelists
   (path regex / service in baseline / verification name format)
