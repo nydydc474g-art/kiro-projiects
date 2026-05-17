@@ -60,7 +60,8 @@ fi
 
 # T1.2: 无 cap（不能 mount/chroot/ptrace）
 echo "  T1.2: capabilities 已全部 drop..."
-CAP_RESULT=$(docker exec agent cat /proc/1/status 2>/dev/null | grep -i capeff | awk '{print $2}')
+CAP_RESULT="$(docker exec agent cat /proc/1/status 2>/dev/null | grep -i capeff | awk '{print $2}' || true)"
+CAP_RESULT="${CAP_RESULT:-unknown}"
 if [ "$CAP_RESULT" = "0000000000000000" ]; then
   pass "CapEff = 0（全部 capabilities 已 drop）"
 else
@@ -77,7 +78,8 @@ fi
 
 # T1.4: /proc 隔离（不能看到宿主机进程）
 echo "  T1.4: /proc 隔离..."
-PROC_COUNT=$(docker exec agent ls /proc/ 2>/dev/null | grep -cE '^[0-9]+$' || echo "0")
+PROC_COUNT="$(docker exec agent ls /proc/ 2>/dev/null | grep -cE '^[0-9]+$' || true)"
+PROC_COUNT="${PROC_COUNT:-0}"
 # 容器内 PID namespace 只有自己的进程，通常 < 20
 if [ "$PROC_COUNT" -lt 50 ]; then
   pass "/proc 隔离正常（可见 PID: $PROC_COUNT）"
@@ -96,7 +98,8 @@ fi
 
 # T1.6: no-new-privileges 生效
 echo "  T1.6: no-new-privileges..."
-NO_NEW_PRIV=$(docker exec agent cat /proc/1/status 2>/dev/null | grep -i nonewprivs | awk '{print $2}')
+NO_NEW_PRIV="$(docker exec agent cat /proc/1/status 2>/dev/null | grep -i nonewprivs | awk '{print $2}' || true)"
+NO_NEW_PRIV="${NO_NEW_PRIV:-unknown}"
 if [ "$NO_NEW_PRIV" = "1" ]; then
   pass "NoNewPrivs = 1（不能提权）"
 else
@@ -276,7 +279,8 @@ fi
 # T3.4: /proc/self/environ 不泄露其他容器变量
 echo "  T3.4: /proc/self/environ 隔离..."
 PROC_ENV=$(docker exec agent cat /proc/self/environ 2>/dev/null | tr '\0' '\n')
-LEAK_COUNT=$(echo "$PROC_ENV" | grep -ciE "DEEPSEEK_API_KEY|GEMINI_API_KEY|TELEGRAM_BOT_TOKEN|CLIPROXYAPI_KEY" || echo "0")
+LEAK_COUNT="$(echo "$PROC_ENV" | grep -ciE "DEEPSEEK_API_KEY|GEMINI_API_KEY|TELEGRAM_BOT_TOKEN|CLIPROXYAPI_KEY" || true)"
+LEAK_COUNT="${LEAK_COUNT:-0}"
 if [ "$LEAK_COUNT" -eq 0 ]; then
   pass "/proc/self/environ 不含其他容器凭据"
 else
@@ -345,7 +349,8 @@ for i in range(100):
         pass
 " 2>/dev/null || true
 sleep 2
-FLOOD_COUNT=$(tail -120 audit_spool/audit-collector.jsonl | grep -c '"event":"FLOOD"' || echo "0")
+FLOOD_COUNT="$(tail -120 audit_spool/audit-collector.jsonl | grep -c '"event":"FLOOD"' || true)"
+FLOOD_COUNT="${FLOOD_COUNT:-0}"
 if [ "$FLOOD_COUNT" -le 55 ]; then
   pass "collector rate limit 生效（100 发送 → $FLOOD_COUNT 落盘，限制 50/s）"
 else
@@ -361,7 +366,7 @@ header "T5: 资源耗尽防护"
 
 # T5.1: PID 限制
 echo "  T5.1: PID 限制 (pids_limit: 256)..."
-PID_RESULT=$(docker exec agent bash -c '
+PID_RESULT="$(docker exec agent bash -c '
 pids=()
 for i in $(seq 1 300); do
   sleep 999 &>/dev/null &
@@ -371,7 +376,8 @@ done
 echo "${#pids[@]}"
 kill "${pids[@]}" 2>/dev/null
 wait 2>/dev/null
-' 2>&1 | tail -1)
+' 2>&1 | tail -1 || true)"
+PID_RESULT="${PID_RESULT:-0}"
 # 256 PID 总量减去已有进程，能 fork 的应该 < 250
 if [ "${PID_RESULT:-0}" -lt 280 ]; then
   pass "PID 限制生效（fork 成功数: ${PID_RESULT:-unknown}）"
