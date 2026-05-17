@@ -142,9 +142,40 @@ squid 白名单       → 锁死网络出口（不可外联）
 - fswatch 事件可能重复触发：用 mv 原子消费 + 时间戳去重
 - agent rebuild agent 会杀掉自己当前会话：可接受，新容器正常启动
 
-## 开放问题
+## 决策记录
 
-1. 配置文件放置方案：软链接 vs 额外 bind mount vs 全放 workspace？
-2. 新增服务是否需要预注册白名单，还是允许 agent 自由新增（但受全局安全规则约束）？
-3. watcher 是否需要 Telegram 通知能力（agent 触发了 rebuild → 你收到通知）？
-4. 是否需要"人工确认模式"（某些高危操作 watcher 暂停等你 approve）？
+| 问题 | 决策 | 理由 |
+|------|------|------|
+| 配置文件放置 | 额外 bind mount 一个 `/project:rw` 目录，指向 `~/ai_sandbox` | agent 能改所有配置文件；但 guard/audit 仍由 `claude_config:/app/.claude:ro` 覆盖，运行时不可篡改 |
+| 新增服务 | 必须预注册白名单，agent 不能自由加服务 | 新增服务可能绕过全局安全规则（比如加一个不走 sandbox_net 的服务），风险最小化 |
+| Telegram 通知 | ✅ watcher 每次执行/拒绝都推通知 | 你手机能实时看到 agent 在干什么基础设施操作 |
+| 人工确认模式 | ❌ 不做 | 违背目标（让 agent 自主闭环），安全靠基线检查兜底 |
+
+### 配置文件方案细节
+
+```yaml
+# compose 中 agent 新增挂载
+volumes:
+  - .:/project:rw                        # agent 可改所有配置文件
+  - ./agent_workspace:/app/workspace:rw  # 原有工作目录
+  - ./claude_config:/app/.claude:ro      # guard/audit 不可篡改（覆盖 /project 里的同名目录）
+  - ./audit_spool:/var/log/audit:ro      # 审计日志只读
+```
+
+安全保证：
+- agent 能写 `/project/docker-compose.yml`、`/project/Dockerfile`、`/project/proxy/squid.conf`
+- 但 `/app/.claude/` 由后挂载的 :ro 覆盖，agent 无法通过 `/project/claude_config/` 篡改运行时 guard
+- watcher 白名单基线检查确保 compose 安全字段不变
+- squid.conf 改了要 rebuild 才生效，rebuild 经 watcher 检查
+
+### 新增服务预注册
+
+agent 想加新服务时：
+1. 修改 compose 添加服务定义
+2. 写 request.json `{"action":"register_service","service":"gemini"}`
+3. watcher **拒绝**，response 写："新增服务需人工确认，请通知操作者"
+4. watcher 推 Telegram："agent 请求注册新服务 gemini，请确认"
+5. 你确认后手动加入 watcher 白名单
+6. 后续 agent 可以自由 rebuild/restart 该服务
+
+这样 agent 能独立完成新服务的代码编写和配置，只有"首次注册"需要你点头。
