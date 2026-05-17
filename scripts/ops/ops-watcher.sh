@@ -2,6 +2,32 @@
 # ops-watcher.sh
 # Step A: 静态判定内核（不接 Telegram，不动 compose）
 #
+# ===== Authoritative Result Invariant (B.3 hotfix) =====
+#
+# Contract (do NOT violate; 5 年后回看的人请遵守):
+#
+#   No notification may be emitted unless the authoritative result JSON
+#   has first been durably published and validated.
+#
+# Order of effects in finalize_proposal() is not negotiable:
+#
+#     1. write_result()    -- produce + validate JSON, then atomic mv
+#     2. consume_request() -- only after authoritative result is on disk
+#     3. archive_proposal()-- only after authoritative result is on disk
+#     4. notify_proposal() -- only after authoritative result is on disk
+#
+# If write_result fails (jq error / disk full / invalid JSON):
+#   - DO NOT consume the request (leave in queue for retry / human inspection)
+#   - DO NOT archive the proposal (it has not been closed)
+#   - DO NOT notify (no split-brain: phone/events vs missing result)
+#   - WRITE an "error" event so operators see it
+#
+# Why this exists: B.3 hotfix found that bash default-arg `${N:-{\}}`
+# expands to literal `{\}` (NOT `{}`), causing jq --argjson to fail silently;
+# `process_request "$id" || true` in main loop swallowed the error; result
+# was published as 0-byte file while telegram was sent as "blocked × BLOCK".
+# The split-brain is the danger; the {\} is just one way to trigger it.
+
 # 状态流（顺序固定）：
 #   request detected
 #     → .ops-watcher.disabled?           → disabled
@@ -86,7 +112,12 @@ ensure_dirs() {
 
 # 写 ops_spool/events.jsonl 单行
 write_event() {
-  local level="$1" msg="$2" id="${3:-}" extra_json="${4:-{\}}"
+  local level="$1" msg="$2"
+  local id="${3:-}"
+  # B.3 hotfix: 不用 ${4:-{\}} —— bash 参数展开里 \} 是字面量，
+  # 会让 --argjson 拿到非法 JSON 导致 jq 静默失败。显式两步赋值最稳。
+  local extra_json="${4:-}"
+  [ -z "$extra_json" ] && extra_json='{}'
   ensure_dirs
   jq -n -c \
     --arg ts "$(ts_utc)" \
@@ -188,10 +219,17 @@ check_snapshot_dir() {
 
 # write_result <id> <status> <risk_level> <reason> <details_json> <preflight_json>
 # manifest 副本由读取 PROPOSALS_DIR/<id>/manifest.json 内嵌
+#
+# B.3 hotfix: 守住 Authoritative Result Invariant
+#   - 默认参数显式补 '{}'（不用 ${N:-{\}}，会变 {\}）
+#   - jq 写完 tmp 后必须 jq empty 校验合法 JSON 才 mv 上权威位置
+#   - 任何一步失败 → 返回非零，调用方（finalize_proposal）必须放弃 consume / archive / notify
 write_result() {
   local id="$1" status="$2" risk_level="$3" reason="$4"
-  local details_json="${5:-{\}}"
-  local preflight_json="${6:-{\}}"
+  local details_json="${5:-}"
+  local preflight_json="${6:-}"
+  [ -z "$details_json" ] && details_json='{}'
+  [ -z "$preflight_json" ] && preflight_json='{}'
 
   ensure_dirs
 
@@ -206,7 +244,7 @@ write_result() {
   tmp=$(mktemp "$RESULTS_DIR/.$id.XXXXXX")
   trap "rm -f '$tmp'" RETURN
 
-  jq -n \
+  if ! jq -n \
     --arg id "$id" \
     --arg status "$status" \
     --arg risk "$risk_level" \
@@ -226,13 +264,30 @@ write_result() {
       details: $details,
       preflight: $preflight,
       applied_files: null
-    }' > "$tmp"
+    }' > "$tmp" 2>/dev/null; then
+    write_event "error" "FATAL: write_result jq failed, refusing to publish" "$id" \
+      "$(jq -n --arg s "$status" --arg r "$risk_level" '{status:$s, risk:$r, stage:"jq"}')"
+    return 1
+  fi
 
-  mv "$tmp" "$result_file"
+  # B.3 hotfix: 校验 tmp 是合法 JSON 才允许成为权威 result
+  # 即使 jq 进程返回 0，文件本身仍可能是 0 字节（极端情况）；jq empty 是真相
+  if ! jq empty "$tmp" 2>/dev/null; then
+    write_event "error" "FATAL: write_result produced invalid JSON, refusing to publish" "$id" \
+      "$(jq -n --arg s "$status" --arg r "$risk_level" '{status:$s, risk:$r, stage:"validate"}')"
+    return 1
+  fi
+
+  if ! mv "$tmp" "$result_file"; then
+    write_event "error" "FATAL: write_result mv failed, authoritative result not published" "$id" \
+      "$(jq -n --arg s "$status" --arg r "$risk_level" '{status:$s, risk:$r, stage:"mv"}')"
+    return 1
+  fi
   trap - RETURN
 
   # 写 summary 路标（派生视图，丢失可重建）
   write_summary "$id" "$status" "$risk_level"
+  return 0
 }
 
 # 派生视图：单行 summary
@@ -1275,11 +1330,26 @@ classify_risk() {
 
 # 终结一个 proposal 的处理：write_result + consume_request + archive_proposal + notify
 # 单一出口确保 notify_proposal 的覆盖与 write_result 严格一致；任何新增状态都在这里加
+#
+# B.3 hotfix: Authoritative Result Invariant 守序契约（见文件头）
+#   write_result 失败时：
+#     - request 不消费（留在队列让 polling 重试 / 人工调查）
+#     - proposal 不归档（它没真的闭合）
+#     - 通知不发（避免 split-brain：手机说 blocked 但 ops-results 是空文件）
+#   写一条 error event；调用方 process_request 收到非零返回继续处理下一个 request
 finalize_proposal() {
   local id="$1" status="$2" risk="$3" reason="$4"
-  local details="${5:-{\}}"
-  local preflight="${6:-{\}}"
-  write_result "$id" "$status" "$risk" "$reason" "$details" "$preflight"
+  local details="${5:-}"
+  local preflight="${6:-}"
+  [ -z "$details" ] && details='{}'
+  [ -z "$preflight" ] && preflight='{}'
+
+  if ! write_result "$id" "$status" "$risk" "$reason" "$details" "$preflight"; then
+    write_event "error" "finalize_proposal: write_result failed; NOT consuming/archiving/notifying" "$id" \
+      "$(jq -n --arg s "$status" --arg r "$risk" '{status:$s, risk:$r}')"
+    return 1
+  fi
+
   consume_request "$id"
   archive_proposal "$id"
   # B.2: should_notify_proposal 内部按 status × risk matrix 过滤；
