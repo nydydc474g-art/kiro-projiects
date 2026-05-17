@@ -1,0 +1,61 @@
+{
+  "schema_version": 1,
+  "_comment": "Ops Watcher security baseline. Edit with care; watcher refuses to operate if this file is malformed.",
+
+  "agent_service_invariants": {
+    "read_only": true,
+    "cap_drop": ["ALL"],
+    "security_opt_required": ["no-new-privileges:true"],
+    "user": "1000:1000"
+  },
+
+  "agent_volumes_required": [
+    "./agent_workspace:/app/workspace:rw",
+    "./claude_config:/app/.claude:ro",
+    "./audit_spool:/var/log/audit:ro"
+  ],
+
+  "global_forbidden_compose_keys": [
+    "privileged",
+    "cap_add",
+    "ports"
+  ],
+
+  "global_forbidden_volume_patterns": [
+    "docker\\.sock",
+    "^/:",
+    "^/Users/",
+    "^/etc/",
+    "^/var/run/",
+    "^/var/lib/docker"
+  ],
+
+  "global_forbidden_network_modes": [
+    "host"
+  ],
+
+  "global_forbidden_namespace_modes": [
+    "pid: host",
+    "pid:host",
+    "ipc: host",
+    "ipc:host",
+    "userns_mode: host",
+    "userns_mode:host"
+  ],
+
+  "allowed_services": [
+    "agent",
+    "squid",
+    "collector",
+    "notifier",
+    "litellm",
+    "cliproxyapi"
+  ],
+
+  "allowed_proposal_paths_regex": "^(docker-compose\\.yml|Dockerfile|proxy/squid\\.conf|proxy/allowed_domains\\.txt|collector/collector\\.py|collector/Dockerfile|notifier/notifier\\.py|notifier/Dockerfile|config/litellm_config\\.yaml|scripts/ops/verifications/[a-zA-Z0-9_-]+\\.sh)$",
+
+  "block_paths_in_changes_regex": "^(claude_config/|\\.env|audit_spool/|cliproxyapi/auths/)",
+
+  "allowed_verifications": [],
+  "_allowed_verifications_note": "Empty array means watcher only validates name format ([a-zA-Z0-9_-]+); strict whitelist starts in Phase 5."
+}
