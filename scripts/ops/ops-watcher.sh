@@ -63,6 +63,13 @@ LAST_TELEGRAM_HTTP_CODE=""  # send_telegram_raw 写入；调用方读它写诊�
 # Polling fallback interval (when fswatch absent)
 POLL_INTERVAL=2
 
+# B.4: launchd 常驻模式参数
+# OPS_STARTUP_DELAY: 启动延迟（秒），等待代理客户端（SR）就绪后再发 started 通知
+# HEARTBEAT_CHECK_INTERVAL: 后台 timer 每隔多少秒 check 是否该发 heartbeat
+#   （heartbeat 实际发送间隔仍由 HEARTBEAT_INTERVAL 控制）
+OPS_STARTUP_DELAY="${OPS_STARTUP_DELAY:-15}"
+HEARTBEAT_CHECK_INTERVAL="${HEARTBEAT_CHECK_INTERVAL:-300}"
+
 # sha256 工具
 if command -v sha256sum >/dev/null 2>&1; then
   SHA256_CMD="sha256sum"
@@ -1501,6 +1508,87 @@ main_loop() {
   fi
 }
 
+# ===== B.4: launchd 常驻模式 =====
+#
+# 与 main_loop 的差异：
+# 1. 启动延迟 OPS_STARTUP_DELAY（等代理客户端就绪）
+# 2. 后台 heartbeat timer 子进程（解决 fswatch 阻塞时漏 tick）
+# 3. trap 里清理子进程
+#
+# 其余行为（闸门链、通知、事件日志、lifecycle 边沿）完全一致。
+# 前台 `bash ops-watcher.sh` 不受任何影响——只有 --launchd 走这条路径。
+
+main_loop_launchd() {
+  # 启动延迟：等待代理客户端（SR/ClashX/Surge）就绪
+  # macOS 重启后 launchd 立即拉起 watcher，但 Login Item 型代理客户端可能还没起
+  if [ "$OPS_STARTUP_DELAY" -gt 0 ]; then
+    echo "[ops-watcher] launchd mode: waiting ${OPS_STARTUP_DELAY}s for proxy readiness..."
+    sleep "$OPS_STARTUP_DELAY"
+  fi
+
+  ensure_dirs
+  load_baseline
+  check_snapshot_dir
+  load_telegram_env
+  write_event "info" "watcher started (launchd)" "" \
+    "$(jq -n --arg pd "$PROJECT_DIR" --arg sd "$SNAPSHOT_DIR" --arg delay "$OPS_STARTUP_DELAY" \
+      '{project_dir: $pd, snapshot_dir: $sd, startup_delay: $delay, mode: "launchd"}')"
+
+  local snap_id
+  snap_id=$(cat "$SNAPSHOT_DIR/.snapshot-id" 2>/dev/null || echo "unknown")
+  notify_lifecycle "started" "snapshot=${snap_id}, mode=launchd"
+
+  # 后台 heartbeat timer（解决 fswatch 模式下长时间无 proposal 流量时漏 tick）
+  # 子进程每 HEARTBEAT_CHECK_INTERVAL 秒 check 一次；check_heartbeat 内部按
+  # HEARTBEAT_INTERVAL（默认 6h）判断是否真发
+  _heartbeat_timer_loop() {
+    while true; do
+      sleep "$HEARTBEAT_CHECK_INTERVAL"
+      check_heartbeat
+    done
+  }
+  _heartbeat_timer_loop &
+  local HEARTBEAT_TIMER_PID=$!
+
+  # 清理：watcher 退出时 kill 后台 timer + 发 stopped 通知
+  trap 'kill $HEARTBEAT_TIMER_PID 2>/dev/null; notify_lifecycle "stopped" "graceful shutdown"; exit 0' INT TERM
+
+  # 首次 lifecycle 状态初始化
+  check_lifecycle_edge
+
+  echo "[ops-watcher] PROJECT_DIR=$PROJECT_DIR"
+  echo "[ops-watcher] SNAPSHOT_DIR=$SNAPSHOT_DIR"
+  echo "[ops-watcher] mode=launchd (heartbeat timer PID=$HEARTBEAT_TIMER_PID, check every ${HEARTBEAT_CHECK_INTERVAL}s)"
+  echo "[ops-watcher] watching $REQUESTS_DIR"
+
+  if command -v fswatch >/dev/null 2>&1; then
+    echo "[ops-watcher] using fswatch + background heartbeat timer"
+    # 处理启动时已积压的 request
+    check_heartbeat
+    for id in $(list_pending_requests); do
+      process_request "$id" || true
+    done
+    fswatch -0 "$REQUESTS_DIR" | while IFS= read -r -d '' _; do
+      sleep 0.2  # debounce
+      check_lifecycle_edge
+      check_heartbeat
+      for id in $(list_pending_requests); do
+        process_request "$id" || true
+      done
+    done
+  else
+    echo "[ops-watcher] fswatch missing, falling back to polling every ${POLL_INTERVAL}s"
+    while true; do
+      check_lifecycle_edge
+      check_heartbeat
+      for id in $(list_pending_requests); do
+        process_request "$id" || true
+      done
+      sleep "$POLL_INTERVAL"
+    done
+  fi
+}
+
 # ===== 入口 =====
 
 case "${1:-}" in
@@ -1522,10 +1610,14 @@ case "${1:-}" in
       process_request "$id" || true
     done
     ;;
+  --launchd)
+    main_loop_launchd
+    ;;
   --help|-h)
     cat <<EOF
 Usage:
   ops-watcher.sh                  Main loop (fswatch + fallback polling)
+  ops-watcher.sh --launchd        Main loop for launchd (startup delay + heartbeat timer)
   ops-watcher.sh --once <id>      Process one request
   ops-watcher.sh --process-all    Process all pending requests once and exit
 
@@ -1538,6 +1630,7 @@ Files:
   Disabled:     touch $DISABLED_FLAG to pause processing
 
 See: OPS-WATCHER-DESIGN.md (Step A)
+     B4-LAUNCHD-DESIGN.md (launchd mode design)
 EOF
     ;;
   "")
