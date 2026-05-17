@@ -389,6 +389,11 @@ else
   fail "PID 限制可能失效（输出: $PID_OUTPUT）"
 fi
 
+# T5.1 后重启 agent 恢复 PID 配额（fork bomb 可能耗尽了所有 PID slot）
+echo "  [恢复] 重启 agent 清理残留进程..."
+docker compose restart agent >/dev/null 2>&1
+sleep 5
+
 # T5.2: /tmp tmpfs 容量限制 (512M)
 echo "  T5.2: /tmp 容量限制..."
 TMP_RESULT=$(docker exec agent bash -c 'dd if=/dev/zero of=/tmp/filltest bs=1M count=600 2>&1; rm -f /tmp/filltest' 2>&1)
