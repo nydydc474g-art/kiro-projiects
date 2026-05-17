@@ -59,7 +59,7 @@ fi
 echo -e "\n=== 2. 端口暴露 ==="
 
 # 2.1 compose 文件中的 ports 声明
-PUBLISHED_PORTS=$(grep -E '^\s+ports:' "$COMPOSE_FILE" | wc -l | tr -d ' ')
+PUBLISHED_PORTS=$(grep -cE '^\s+ports:' "$COMPOSE_FILE" || true)
 if [ "$PUBLISHED_PORTS" -gt 0 ]; then
   fail "docker-compose.yml 存在 ports: 声明，服务可能暴露到宿主机"
   grep -A2 'ports:' "$COMPOSE_FILE" || true
