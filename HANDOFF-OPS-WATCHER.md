@@ -1511,3 +1511,63 @@ watcher 已重启并正常运行（started + heartbeat + BLOCK 通知验证通�
 
 分支名从 `ops-watcher-step-b-hotfix` 演化为 `ops-watcher-step-b-hotfix-auth-result-invariant`。合并时机和方式留到 B.4 完成后再讨论。不主动合并 / rebase。
 
+
+
+
+---
+
+## Checkpoint：B.3 失败路径实证（2026-05-18）
+
+> 追加日志，不改前文。B.3 最后一块拼图：通知失败时的守约行为。
+
+### 一句话
+
+关掉 SR（真实网络故障）→ 提交 LOW proposal → watcher 正常处理但通知失败 http_code=000 → `.notified.txt` 不追加。恢复 SR → 提交新 LOW proposal → 通知成功 http_code=200 → `.notified.txt` 正常追加。两条不变量闭合。
+
+### 实证记录
+
+| 阶段 | proposal id | status × risk | telegram | http_code | .notified.txt |
+|------|-------------|---------------|----------|-----------|---------------|
+| 失败半边（SR 关闭） | 20260518-012249-a65171 | accepted_for_review × LOW | send failed | 000 | **未追加** ✅ |
+| 恢复半边（SR 恢复） | 20260518-012406-cce4a5 | accepted_for_review × LOW | sent | 200 | **已追加** ✅ |
+
+### 验证的两条不变量
+
+1. **「发不出不伪装」**：`send_telegram_raw` 返回 1 → `notify_proposal` 不追加 `.notified.txt` → 幂等表干净
+2. **「恢复后不补发旧 proposal」**：a65171 的 request 已被 `consume_request` 移到 `.processed/`，watcher 主循环永远不会重扫它。恢复网络后只有新 proposal (cce4a5) 正常走通知流程
+
+### 为什么不补发是正确的
+
+- request 消费是原子的（`finalize_proposal` 无论通知成败都执行 `consume_request`）
+- result file 已正确写入（a65171.json status=accepted_for_review，权威记录完整）
+- events.jsonl 记录了 `telegram send failed http_code=000`（审计可追溯）
+- 如果未来需要"补发"语义，由外部 reconciler 扫 `.notified.txt` vs `ops-results/` 差集实现（Phase 5+），不在 watcher 主循环里加重试
+
+### B.3 完整闭合状态
+
+| 测试维度 | 状态 |
+|----------|------|
+| 通知矩阵 4/4（LOW/MEDIUM/HIGH/BLOCK） | ✅ |
+| Lifecycle 4/4（started/disabled/resumed/stopped） | ✅ |
+| Heartbeat 端到端 | ✅ |
+| 失败路径（http_code=000 + 不污染幂等表） | ✅ |
+| Authoritative Result Invariant（守序契约） | ✅ |
+
+**Step B.3 正式闭合。** 剩余只有 B.4 launchd 常驻运行的生产实测。
+
+### 当前 .notified.txt 全貌（累计 5 行）
+
+```
+20260517-122027-ea3b87:accepted_for_review:LOW
+20260517-122337-7f1f91:accepted_for_review:MEDIUM
+20260517-123059-9048d1:accepted_for_review:HIGH
+20260517-140640-3943c0:blocked:BLOCK
+20260518-012406-cce4a5:accepted_for_review:LOW
+```
+
+注意：a65171 **不在表中**（失败路径的物理证据）。
+
+### B.4 待办（不变）
+
+- [ ] launchd plist 安装 + 生产实测（8 项验证清单见 B4-LAUNCHD-DESIGN.md）
+- [ ] 代码已就绪（`--launchd` 入口 + `main_loop_launchd` + plist 文件），等用户决定何时切到常驻模式
